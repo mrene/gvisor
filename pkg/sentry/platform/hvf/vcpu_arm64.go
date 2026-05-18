@@ -49,7 +49,12 @@ static void saveFPRegs(hv_vcpu_t vcpu, void *buf) {
 // a uint64[31] buffer and reads X16, X17 from the vCPU via API.
 static void copyStatePageGPRegs(hv_vcpu_t vcpu, const void *statePage, uint64_t *buf) {
     const uint64_t *sp = (const uint64_t *)statePage;
-    for (int i = 0; i < 16; i++) buf[i] = sp[i];
+    for (int i = 0; i < 9; i++) buf[i] = sp[i];
+    // X9, X10 may be clobbered by the 0x200 TLB fault handler
+    // (used to save/restore SPSR_EL1 and ELR_EL1). Read from API.
+    hv_vcpu_get_reg(vcpu, HV_REG_X9, &buf[9]);
+    hv_vcpu_get_reg(vcpu, HV_REG_X10, &buf[10]);
+    for (int i = 11; i < 16; i++) buf[i] = sp[i];
     hv_vcpu_get_reg(vcpu, HV_REG_X16, &buf[16]);
     hv_vcpu_get_reg(vcpu, HV_REG_X17, &buf[17]);
     for (int i = 18; i < 31; i++) buf[i] = sp[i];
@@ -279,12 +284,19 @@ func (m *machine) setupSharedMemory() error {
 			binary.LittleEndian.PutUint32(vectors[off:], instr)
 			off += 4
 		}
-		put(0xd5384009) // MRS X9, SPSR_EL1 (save — overwritten by exception)
+		// Save both SPSR_EL1 and ELR_EL1 — current-EL exception
+		// overwrites both. Use X9 (SPSR) and X10 (ELR). These
+		// clobber guest X9/X10 but the STP chain will overwrite
+		// them with correct values after retry. The sentry reads
+		// X9/X10 from the vCPU API to get the correct guest values.
+		put(0xd5384009) // MRS X9, SPSR_EL1
+		put(0xd538400a) // MRS X10, ELR_EL1
 		put(0xd508831f) // TLBI VMALLE1IS
 		put(0xd5033b9f) // DSB ISH
 		put(0xd5033fdf) // ISB
-		put(0xd5184009) // MSR SPSR_EL1, X9 (restore for ERET to EL0)
-		put(0xd69f03e0) // ERET (retry faulting instruction)
+		put(0xd5184009) // MSR SPSR_EL1, X9
+		put(0xd518400a) // MSR ELR_EL1, X10
+		put(0xd69f03e0) // ERET
 	}
 
 	// el0_sync at 0x400: read ESR_EL1, classify exception.
@@ -367,14 +379,13 @@ func (m *machine) setupSharedMemory() error {
 		put(0xb5000060) // CBNZ X0, .+12 (→ slow)
 		put(0xd2800020) // MOV X0, #1  PATCHABLE at vectors[0x630]
 		put(0xd69f03e0) // ERET
-		// set_tid_address(96): return TID, skip SetClearTID.
-		// SetClearTID only matters at thread exit (futex wake).
-		// Single-process workloads: no observable difference.
-		// off=0x638
-		put(0xf101811f) // CMP X8, #96
-		put(0x54000061) // B.NE .+12 (→ slow)
-		put(0xd2800020) // MOV X0, #1  PATCHABLE at vectors[fastPathSetTidOff]
-		put(0xd69f03e0) // ERET
+		// set_tid_address(96): NOT fast-pathed. It must call
+		// SetClearTID for pthread_join/CLONE_CHILD_CLEARTID to work.
+		// Falls through to slow path (STP chain → HVC #9).
+		put(0xd503201f) // NOP (alignment)
+		put(0xd503201f) // NOP
+		put(0xd503201f) // NOP
+		put(0xd503201f) // NOP
 		// slow: save X0-X30 to state page, then HVC #9.
 		// Full STP chain. Cold TLB → fault to 0x200 → TLBI+ERET retry.
 		put(0xd538d090) // MRS X16, TPIDR_EL1
@@ -529,7 +540,7 @@ const (
 	// Extended handler (0x600+)
 	fastPathGetpgidOff  = 0x61C // getpgid(155) when X0==0
 	fastPathGetsidOff   = 0x630 // getsid(156) when X0==0
-	fastPathSetTidOff   = 0x640 // set_tid_address(96) returns TID
+	// set_tid_address removed from fast path (needs SetClearTID)
 )
 
 // encodeMOVZ returns the ARM64 encoding for MOVZ X0, #imm16.
@@ -555,7 +566,6 @@ func (m *machine) PatchFastPathSyscalls(pid, ppid, tid, uid, euid, gid, egid, pg
 	binary.LittleEndian.PutUint32(vec[fastPathGettidOff:], encodeMOVZ(tid))
 	binary.LittleEndian.PutUint32(vec[fastPathGetpgidOff:], encodeMOVZ(pgid))
 	binary.LittleEndian.PutUint32(vec[fastPathGetsidOff:], encodeMOVZ(sid))
-	binary.LittleEndian.PutUint32(vec[fastPathSetTidOff:], encodeMOVZ(tid))
 }
 
 // SigreturnAddr is the guest VA of the sigreturn trampoline in the
