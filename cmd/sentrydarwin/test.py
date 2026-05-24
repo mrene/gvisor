@@ -291,10 +291,10 @@ run_test("deep nesting", '/bin/sh -c "/bin/sh -c \\"/bin/echo nested3\\""', "nes
 # --- Stress ---
 section("Stress")
 run_test("fork 10+wait", "i=0; while [ $i -lt 10 ]; do (true) & i=$((i+1)); done; wait; echo f10", "f10", 15)
-# fork 50 is known-flaky: the 0x200 TLB fault handler clobbers X9
-# (SPSR save) which corrupts the guest's X9 when the state page TLB
-# is cold. Ash uses X9 in its SIGCHLD handler, so heavy fork workloads
-# (~50 children) occasionally crash. The C binary version is 90%+ reliable.
+# fork 50 is known-flaky (~35% pass rate): heavy fork workloads
+# trigger intermittent SIGSEGV in the shell's SIGCHLD storm handling.
+# The 0x200 TLB fault handler is zero-clobber (TLBI+ERET only),
+# so this is likely a separate page fault handling race.
 run_test("exec 200x", "for i in $(seq 1 200); do /bin/true; done; echo e200", "e200", 35)
 run_test("stat 1000x", "for i in $(seq 1 1000); do stat /bin/busybox > /dev/null; done; echo st", "st", 25)
 py_test("mmap 64MB", """

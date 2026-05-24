@@ -125,21 +125,20 @@ TLBI ASIDE1IS on every guest entry for TLB coherency.
 
 The EL1 STP chain (saving guest GP registers to the state page) may
 fault when the state page TLB entry is cold (after TLBI). The 0x200
-handler (current-EL SPx sync) handles this:
+handler (current-EL SPx sync) handles this with a zero-clobber design:
 
-1. Save SPSR_EL1 to X9 (current-EL exception overwrites it)
-2. Save ELR_EL1 to X10 (current-EL exception overwrites it)
-3. TLBI VMALLE1IS + DSB ISH + ISB
-4. Restore SPSR_EL1 and ELR_EL1
-5. ERET (retries the faulting STP)
+1. TLBI VMALLE1IS + DSB ISH + ISB (flush TLB)
+2. ERET (retries the faulting STP)
 
-**Known limitation:** X9 and X10 are clobbered by the handler. If the
-fault occurs before STP saves them, the guest's X9/X10 values are lost.
-The sentry reads X9/X10 from the vCPU API (`hv_vcpu_get_reg`) instead
-of the state page, but the API values are also the clobbered ones
-(SPSR/ELR). This causes intermittent crashes in fork-heavy workloads
-(~50 children) where the shell's SIGCHLD handler uses X9. The C binary
-equivalent is 90%+ reliable because it doesn't use X9 in its signal path.
+The handler does not touch any GP register or memory. It works because
+the el0_sync slow path saves guest ELR_EL1 → X17 and SPSR_EL1 → X18
+**before** the STP chain begins. The current-EL exception automatically
+sets ELR/SPSR to the faulting STP's address and EL1 PSTATE, which is
+exactly what ERET needs to retry. X17 and X18 are already sacrificial
+(clobbered by el0_sync's ESR/syscall-number check), so using them for
+guest PC/PSTATE is free. After retry, the STP chain stores X17/X18 to
+the state page. The sentry reads X17 from the vCPU API (guest PC) and
+X18 from the state page (guest PSTATE).
 
 ## IPA Space Layout
 
@@ -218,11 +217,6 @@ Key adaptations for macOS:
 
 ## Known Limitations
 
-- **X9 clobber in 0x200 handler**: The TLB fault recovery handler uses
-  X9 to save/restore SPSR_EL1. When the state page TLB is cold,
-  the guest's X9 is corrupted. Affects fork-heavy shell workloads
-  (~50 children) where ash uses X9 in SIGCHLD handling. C binaries
-  are 90%+ reliable.
 - **Crypto instructions**: AES/SHA/PMULL hidden in ISAR0/HWCAP due to
   intermittent HVF EC=0 traps during OpenSSL init
 - **DC ZVA**: Prohibited (DCZID DZP=1) since SCTLR DZE=0
