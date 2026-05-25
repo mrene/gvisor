@@ -582,7 +582,11 @@ const SigreturnAddr = 0x804
 // If skipAll is true, skip all register loading (regs unchanged since last exit).
 func (c *vCPU) loadRegisters(ac *arch.Context64, skipAll bool) {
 	if skipAll {
-		// Bare ERET — no register changes, no TLBI needed.
+		// Bare ERET — GP regs unchanged, no TLBI needed.
+		// Must restore ELR/SPSR because the 0x200 TLB fault handler
+		// or HVF cancel may have clobbered them.
+		c.setSysReg(C.HV_SYS_REG_ELR_EL1, ac.Regs.Pc)
+		c.setSysReg(C.HV_SYS_REG_SPSR_EL1, ac.Regs.Pstate&^0xf)
 		c.setReg(C.HV_REG_PC, c.machine.vectorsAddr+0x800)
 		c.setReg(C.HV_REG_CPSR, 0x3c5)
 		return

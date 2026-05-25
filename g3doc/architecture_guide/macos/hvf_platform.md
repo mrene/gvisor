@@ -140,6 +140,11 @@ guest PC/PSTATE is free. After retry, the STP chain stores X17/X18 to
 the state page. The sentry reads X17 from the vCPU API (guest PC) and
 X18 from the state page (guest PSTATE).
 
+HVF may also exit with EC=0x25 (current-EL data abort) instead of
+routing through the 0x200 vector. The sentry handles this by
+re-entering the vCPU with `skipAll`, letting the 0x200 handler
+resolve the fault in-VM on the next run.
+
 ## IPA Space Layout
 
 ```
@@ -222,4 +227,8 @@ Key adaptations for macOS:
 - **DC ZVA**: Prohibited (DCZID DZP=1) since SCTLR DZE=0
 - **Fast-path per-process**: PID/TID/UID values in shared vectors page
   are only correct for the init process
+- **Fork-heavy workloads**: ~50% reliability at 50 concurrent
+  fork+exit operations. HVF can reset vCPU state on cancel
+  (CPSR=0x800003c5, all GP regs zeroed), causing stale register
+  state in signal frames during SIGCHLD storms
 - **FEX-Emu**: Blocked by Apple Silicon L3 permission upgrade hardware bug
