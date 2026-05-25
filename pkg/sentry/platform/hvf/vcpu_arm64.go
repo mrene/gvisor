@@ -641,8 +641,6 @@ func (c *vCPU) saveRegisters(ac *arch.Context64) {
 		// and SPSR→X18 before the STP chain. The 0x200 TLB fault
 		// handler (TLBI+ERET) preserves all GP registers, so X17/X18
 		// survive even if the STP chain faulted and retried.
-		// X17 is read from vCPU API (copyStatePageGPRegs does this).
-		// X18 is read from the state page (STP saved it there).
 		regs.Pc = regs.Regs[17]
 		regs.Pstate = regs.Regs[18] &^ 0xf
 	} else {

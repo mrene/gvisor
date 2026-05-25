@@ -365,7 +365,15 @@ func (c *hvfContext) Switch(
 				return returnAndRelease(&c.info, hostarch.NoAccess, platform.ErrContextSignal)
 			}
 
-			if ec == 0x24 || ec == 0x25 || ec == 0x20 || ec == 0x21 { // Direct data/instruction abort
+			if ec == 0x25 || ec == 0x21 {
+				// Current-EL abort: EL1 handler faulted (e.g., TTBR1
+				// state page TLB miss). Re-enter to let the 0x200
+				// handler resolve it. Don't save registers — the
+				// vCPU is mid-exception-handler with clobbered state.
+				skipAll = true
+				continue
+			}
+			if ec == 0x24 || ec == 0x20 { // Lower-EL data/instruction abort
 				vcpu.saveFP = true
 				vcpu.saveRegisters(ac)
 				ac.Regs.Pc = vcpu.getReg(C.HV_REG_PC)
@@ -378,12 +386,12 @@ func (c *hvfContext) Switch(
 
 			vcpu.saveFP = true
 			vcpu.saveRegisters(ac)
-			pc := vcpu.getReg(C.HV_REG_PC)
-			ac.Regs.Pc = pc
+			illPC := vcpu.getReg(C.HV_REG_PC)
+			ac.Regs.Pc = illPC
 			c.info = linux.SignalInfo{}
 			c.info.Signo = int32(linux.SIGILL)
-			c.info.SetAddr(pc)
-			log.Debugf("HVF: unhandled exception ec=%#x at PC=%#x, delivering SIGILL", ec, pc)
+			c.info.SetAddr(illPC)
+			log.Debugf("HVF: unhandled exception ec=%#x at PC=%#x, delivering SIGILL", ec, illPC)
 			return returnAndRelease(&c.info, hostarch.NoAccess, platform.ErrContextSignal)
 
 		case exitReasonVtimerActivated:
@@ -400,8 +408,6 @@ func (c *hvfContext) Switch(
 			continue
 
 		case exitReasonCanceled:
-			pc := vcpu.getReg(C.HV_REG_PC)
-			log.Debugf("HVF canceled: PC=%#x", pc)
 			return returnAndRelease(nil, hostarch.NoAccess, platform.ErrContextInterrupt)
 
 		default:
