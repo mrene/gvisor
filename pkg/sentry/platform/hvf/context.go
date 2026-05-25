@@ -275,7 +275,6 @@ func (c *hvfContext) Switch(
 
 				// HVC #9: SVC exit from el0_sync handler.
 				// GP regs saved to state page by STP chain.
-				// Skip FP save — syscall dispatch doesn't touch FP.
 				if hvcImm == 9 {
 					vcpu.gpInStatePage = true
 					vcpu.saveFP = true
@@ -459,7 +458,11 @@ func (c *hvfContext) PullFullState(_ platform.AddressSpace, _ *arch.Context64) e
 // FullStateChanged implements platform.Context.FullStateChanged.
 // Called when the sentry modifies registers beyond the syscall return value
 // (e.g., signal delivery, clone, execve, rt_sigreturn).
-func (c *hvfContext) FullStateChanged() {}
+func (c *hvfContext) FullStateChanged() {
+	if c.lastVCPU != nil {
+		c.lastVCPU.fpLoaded = false
+	}
+}
 
 // PrepareSleep implements platform.Context.PrepareSleep.
 func (*hvfContext) PrepareSleep() {}
