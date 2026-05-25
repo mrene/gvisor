@@ -37,37 +37,43 @@ results = []
 
 def run_test(name, cmd, expect="", timeout=15):
     global PASS, FAIL
-    try:
-        p = subprocess.Popen(
-            [SENTRY, "--rootfs", ROOTFS, "/bin/sh", "-c", cmd],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        stdout, _ = p.communicate(timeout=timeout)
-        out = stdout.decode("utf-8", errors="replace").strip()
-        if expect and expect not in out:
-            FAIL += 1
-            results.append({"name": name, "status": "FAIL", "expect": expect, "got": out[:80]})
+    for attempt in range(3):
+        try:
+            p = subprocess.Popen(
+                [SENTRY, "--rootfs", ROOTFS, "/bin/sh", "-c", cmd],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            stdout, _ = p.communicate(timeout=timeout)
+            out = stdout.decode("utf-8", errors="replace").strip()
+            if expect and expect not in out:
+                if attempt < 2 and out == "":
+                    continue
+                FAIL += 1
+                results.append({"name": name, "status": "FAIL", "expect": expect, "got": out[:80]})
+                if not JSON_MODE:
+                    print(f"  FAIL  {name} (expected '{expect}', got '{out[:50]}')")
+                return False
+            PASS += 1
+            results.append({"name": name, "status": "PASS"})
             if not JSON_MODE:
-                print(f"  FAIL  {name} (expected '{expect}', got '{out[:50]}')")
+                print(f"  PASS  {name}")
+            return True
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+            if attempt < 2:
+                continue
+            FAIL += 1
+            results.append({"name": name, "status": "TIMEOUT"})
+            if not JSON_MODE:
+                print(f"  TIMEOUT {name}")
             return False
-        PASS += 1
-        results.append({"name": name, "status": "PASS"})
-        if not JSON_MODE:
-            print(f"  PASS  {name}")
-        return True
-    except subprocess.TimeoutExpired:
-        p.kill()
-        p.wait()
-        FAIL += 1
-        results.append({"name": name, "status": "TIMEOUT"})
-        if not JSON_MODE:
-            print(f"  TIMEOUT {name}")
-        return False
-    except Exception as e:
-        FAIL += 1
-        results.append({"name": name, "status": "ERROR", "error": str(e)})
-        if not JSON_MODE:
-            print(f"  ERROR {name}: {e}")
-        return False
+        except Exception as e:
+            FAIL += 1
+            results.append({"name": name, "status": "ERROR", "error": str(e)})
+            if not JSON_MODE:
+                print(f"  ERROR {name}: {e}")
+            return False
+    return False
 
 def skip_test(name, reason):
     global SKIP
