@@ -173,19 +173,19 @@ func (kpt *kernelPageTable) release() {
 	defer kpt.mu.Unlock()
 
 	for _, l3 := range kpt.l3Tables {
-		kpt.machine.ptAlloc.freePage(l3.hostMem, l3.ipa)
+		kpt.machine.ptAlloc.freePage(l3.hostMem, l3.ipa, 16384)
 	}
 	kpt.l3Tables = nil
 	for _, l2 := range kpt.l2Tables {
-		kpt.machine.ptAlloc.freePage(l2.hostMem, l2.ipa)
+		kpt.machine.ptAlloc.freePage(l2.hostMem, l2.ipa, 16384)
 	}
 	kpt.l2Tables = nil
 	for _, l1 := range kpt.l1Tables {
-		kpt.machine.ptAlloc.freePage(l1.hostMem, l1.ipa)
+		kpt.machine.ptAlloc.freePage(l1.hostMem, l1.ipa, 16384)
 	}
 	kpt.l1Tables = nil
 	if kpt.l0Host != nil {
-		kpt.machine.ptAlloc.freePage(kpt.l0Host, kpt.l0IPA)
+		kpt.machine.ptAlloc.freePage(kpt.l0Host, kpt.l0IPA, 16384)
 		kpt.l0Host = nil
 	}
 }

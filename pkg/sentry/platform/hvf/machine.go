@@ -241,12 +241,16 @@ func (m *machine) Get() *vCPU {
 	// Hold the lock across createVCPU to prevent concurrent goroutines
 	// from assigning duplicate IDs or racing on the vcpus slice.
 	id := len(m.vcpus)
+	if id >= m.maxVCPUs {
+		m.mu.Unlock()
+		runtime.UnlockOSThread()
+		panic(fmt.Sprintf("vCPU limit reached (%d), cannot create more", m.maxVCPUs))
+	}
 
 	c, err := m.createVCPU(id)
 	if err != nil {
 		m.mu.Unlock()
 		runtime.UnlockOSThread()
-		// Matches KVM platform behavior: vCPU creation failure is fatal.
 		panic(fmt.Sprintf("failed to create vCPU: %v", err))
 	}
 

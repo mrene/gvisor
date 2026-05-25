@@ -204,6 +204,7 @@ func (c *hvfContext) Switch(
 
 	unknownExits := 0
 	vtimerExits := 0
+	currentELRetries := 0
 	skipAll := false
 	for {
 		t0 := time.Now()
@@ -368,10 +369,23 @@ func (c *hvfContext) Switch(
 			if ec == 0x25 || ec == 0x21 {
 				// Current-EL abort: EL1 handler faulted (e.g., TTBR1
 				// state page TLB miss). Re-enter to let the 0x200
-				// handler resolve it. Don't save registers — the
-				// vCPU is mid-exception-handler with clobbered state.
-				skipAll = true
-				continue
+				// handler resolve it. Only retry for translation faults
+				// (DFSC 0x04-0x07); permission faults indicate a real
+				// mapping error and must not spin.
+				dfsc := syndrome & 0x3f
+				if dfsc >= 0x04 && dfsc <= 0x07 && currentELRetries < 100 {
+					currentELRetries++
+					skipAll = true
+					continue
+				}
+				log.Warningf("HVF: current-EL abort not recoverable: EC=%#x DFSC=%#x retries=%d",
+					ec, dfsc, currentELRetries)
+				vcpu.saveFP = true
+				vcpu.saveRegisters(ac)
+				c.info = linux.SignalInfo{}
+				c.info.Signo = int32(linux.SIGSEGV)
+				c.info.SetAddr(vcpu.getFaultAddress())
+				return returnAndRelease(&c.info, hostarch.NoAccess, platform.ErrContextSignal)
 			}
 			if ec == 0x24 || ec == 0x20 { // Lower-EL data/instruction abort
 				vcpu.saveFP = true

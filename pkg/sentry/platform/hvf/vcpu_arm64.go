@@ -176,8 +176,8 @@ func (c *vCPU) initialize() error {
 		(0x3 << 12) | // SH0
 		(tg0 << 14) | // TG0: 4K or 16K
 		(uint64(16) << 16) | // T1SZ=16 → 48-bit VA
-		(0x1 << 24) | // ORGN1
-		(0x1 << 26) | // IRGN1
+		(0x1 << 24) | // IRGN1
+		(0x1 << 26) | // ORGN1
 		(0x3 << 28) | // SH1
 		(uint64(0x1) << 30) | // TG1: 16K (kernel stays 16K)
 		(uint64(0x2) << 32) | // IPS: 40-bit PA
@@ -410,39 +410,6 @@ func (m *machine) setupSharedMemory() error {
 		put(stpEnc(28, 29, 16, 0xE0))
 		put(0xF9000000 | uint32((0xF0/8)<<10) | uint32(16<<5) | 30) // STR X30
 		put(0xd4000122) // HVC #9
-	}
-
-	// Fault STP chain at 0x700: same as slow-path STP but HVC #8.
-	// The 0x200 TLBI+ERET recovery handles cold TLB faults.
-	{
-		off := 0x700
-		put := func(instr uint32) {
-			binary.LittleEndian.PutUint32(vectors[off:], instr)
-			off += 4
-		}
-		stpEnc := func(rt1, rt2, rn, byteOff int) uint32 {
-			return 0xA9000000 | uint32(((byteOff/8)&0x7F)<<15) | uint32(rt2<<10) | uint32(rn<<5) | uint32(rt1)
-		}
-		// Save guest ELR/SPSR to X17/X18 (same as slow SVC path).
-		put(0xd5384031) // MRS X17, ELR_EL1
-		put(0xd5384012) // MRS X18, SPSR_EL1
-		put(0xd538d090) // MRS X16, TPIDR_EL1
-		put(stpEnc(0, 1, 16, 0x00))
-		put(stpEnc(2, 3, 16, 0x10))
-		put(stpEnc(4, 5, 16, 0x20))
-		put(stpEnc(6, 7, 16, 0x30))
-		put(stpEnc(8, 9, 16, 0x40))
-		put(stpEnc(10, 11, 16, 0x50))
-		put(stpEnc(12, 13, 16, 0x60))
-		put(stpEnc(14, 15, 16, 0x70))
-		put(stpEnc(18, 19, 16, 0x90))
-		put(stpEnc(20, 21, 16, 0xA0))
-		put(stpEnc(22, 23, 16, 0xB0))
-		put(stpEnc(24, 25, 16, 0xC0))
-		put(stpEnc(26, 27, 16, 0xD0))
-		put(stpEnc(28, 29, 16, 0xE0))
-		put(0xF9000000 | uint32((0xF0/8)<<10) | uint32(16<<5) | 30) // STR X30
-		put(0xd4000102) // HVC #8
 	}
 
 	// Single-instruction ERET at 0x800 (unused, kept for compat).

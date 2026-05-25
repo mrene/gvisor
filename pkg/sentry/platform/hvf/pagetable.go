@@ -289,22 +289,22 @@ func (pt *guestPageTable) release() {
 				}
 			}
 		}
-		pt.machine.ptAlloc.freePage(l3.hostMem, l3.ipa)
+		pt.machine.ptAlloc.freePage(l3.hostMem, l3.ipa, uint64(hvfPageSize))
 	}
 	pt.l3Tables = nil
 
 	for _, l2 := range pt.l2Tables {
-		pt.machine.ptAlloc.freePage(l2.hostMem, l2.ipa)
+		pt.machine.ptAlloc.freePage(l2.hostMem, l2.ipa, uint64(hvfPageSize))
 	}
 	pt.l2Tables = nil
 
 	for _, l1 := range pt.l1Tables {
-		pt.machine.ptAlloc.freePage(l1.hostMem, l1.ipa)
+		pt.machine.ptAlloc.freePage(l1.hostMem, l1.ipa, uint64(hvfPageSize))
 	}
 	pt.l1Tables = nil
 
 	if pt.l0Host != nil {
-		pt.machine.ptAlloc.freePage(pt.l0Host, pt.l0IPA)
+		pt.machine.ptAlloc.freePage(pt.l0Host, pt.l0IPA, uint64(hvfPageSize))
 		pt.l0Host = nil
 	}
 }

@@ -51,9 +51,9 @@ type ipaAllocator struct {
 	hostToIPA map[uintptr]uint64
 	// refCount tracks how many address spaces reference each IPA.
 	refCount map[uint64]int
-	// freeIPAs holds IPAs that were unmapped and can be reused.
-	// Prevents nextIPA from growing without bound.
-	freeIPAs []uint64
+	// freeIPAs holds IPAs that were unmapped and can be reused,
+	// keyed by page size. Prevents nextIPA from growing without bound.
+	freeIPAs map[uintptr][]uint64
 	// ipaToHost is the reverse of hostToIPA for O(1) cleanup.
 	ipaToHost map[uint64]uintptr
 	// ipaSize tracks the mapped size of each IPA for correct unmapping.
@@ -79,6 +79,7 @@ func newIPAAllocator() *ipaAllocator {
 		ipaToHost:   make(map[uint64]uintptr),
 		ipaSize:     make(map[uint64]uintptr),
 		refCount:    make(map[uint64]int),
+		freeIPAs:    make(map[uintptr][]uint64),
 		shadowPages: make(map[uint64]unsafe.Pointer),
 	}
 }
@@ -147,15 +148,16 @@ func (a *ipaAllocator) mapPageInternal(hostAddr uintptr, size uintptr, shadow bo
 	// ipaReuseThreshold: prefer fresh IPAs until 512GB to avoid
 	// stage-2 TLB staleness from immediate IPA reuse.
 	const ipaReuseThreshold = 1 << 39 // 512GB
-	if a.nextIPA < ipaReuseThreshold || len(a.freeIPAs) == 0 {
+	freeList := a.freeIPAs[size]
+	if a.nextIPA < ipaReuseThreshold || len(freeList) == 0 {
 		if a.nextIPA+uint64(size) > ipaMax {
 			return 0, fmt.Errorf("IPA space exhausted (next=%#x, max=%#x)", a.nextIPA, uint64(ipaMax))
 		}
 		ipa = a.nextIPA
 		a.nextIPA += uint64(size)
 	} else {
-		ipa = a.freeIPAs[len(a.freeIPAs)-1]
-		a.freeIPAs = a.freeIPAs[:len(a.freeIPAs)-1]
+		ipa = freeList[len(freeList)-1]
+		a.freeIPAs[size] = freeList[:len(freeList)-1]
 	}
 
 	// Determine the VA to pass to hv_vm_map.
@@ -224,7 +226,7 @@ func (a *ipaAllocator) unmapIPA(ipa uint64) {
 			delete(a.shadowPages, ipa)
 		}
 
-		a.freeIPAs = append(a.freeIPAs, ipa)
+		a.freeIPAs[size] = append(a.freeIPAs[size], ipa)
 	}
 }
 
@@ -240,6 +242,7 @@ type ptPageAllocator struct {
 type ptPage struct {
 	hostMem unsafe.Pointer
 	ipa     uint64
+	size    uint64
 }
 
 // ptBase is the start of the page-table IPA range (within the first 1MB).
@@ -270,11 +273,11 @@ func (p *ptPageAllocator) allocPageSize(size uint64) (hostMem unsafe.Pointer, ip
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Try to reuse a free page (only if same size).
-	if size == uint64(hvfPageSize) {
-		if n := len(p.freeList); n > 0 {
-			page := p.freeList[n-1]
-			p.freeList = p.freeList[:n-1]
+	// Try to reuse a free page of matching size.
+	for i := len(p.freeList) - 1; i >= 0; i-- {
+		if p.freeList[i].size == size {
+			page := p.freeList[i]
+			p.freeList = append(p.freeList[:i], p.freeList[i+1:]...)
 			C.memset(page.hostMem, 0, C.size_t(size))
 			return page.hostMem, page.ipa, nil
 		}
@@ -306,10 +309,10 @@ func (p *ptPageAllocator) allocPageSize(size uint64) (hostMem unsafe.Pointer, ip
 }
 
 // freePage returns a page table page to the free list for reuse.
-func (p *ptPageAllocator) freePage(hostMem unsafe.Pointer, ipa uint64) {
+func (p *ptPageAllocator) freePage(hostMem unsafe.Pointer, ipa uint64, size uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.freeList = append(p.freeList, ptPage{hostMem: hostMem, ipa: ipa})
+	p.freeList = append(p.freeList, ptPage{hostMem: hostMem, ipa: ipa, size: size})
 }
 
 // patchIDRegisterReads scans a code page for MRS instructions that read
