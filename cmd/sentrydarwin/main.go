@@ -300,7 +300,7 @@ func main() {
 
 	// Restore from checkpoint if --restore is set.
 	if *flagRestore != "" {
-		restoreFromCheckpoint(k, plat, *flagRestore, *flagRootfs)
+		restoreFromCheckpoint(k, plat, *flagRestore, *flagRootfs, *flagCheckpoint)
 		return
 	}
 
@@ -665,7 +665,7 @@ func setupGofer(k *kernel.Kernel, hostDir string) int {
 	return fds[1]
 }
 
-func restoreFromCheckpoint(k *kernel.Kernel, plat *hvf.HVF, ckptPath, rootfsPath string) {
+func restoreFromCheckpoint(k *kernel.Kernel, plat *hvf.HVF, ckptPath, rootfsPath, checkpointPath string) {
 	log.Infof("Restore: loading from %s", ckptPath)
 
 	f, err := os.Open(ckptPath)
@@ -700,6 +700,28 @@ func restoreFromCheckpoint(k *kernel.Kernel, plat *hvf.HVF, ckptPath, rootfsPath
 		fatal("LoadFrom: %v", err)
 	}
 	log.Infof("Restore: kernel loaded successfully")
+
+	// Forward host signals to the restored guest.
+	var checkpointing atomic.Bool
+	sigCh := make(chan os.Signal, 4)
+	signal.Notify(sigCh, unix.SIGINT, unix.SIGTERM, unix.SIGHUP, unix.SIGWINCH, unix.SIGALRM, unix.SIGUSR1)
+	go func() {
+		for sig := range sigCh {
+			s := sig.(unix.Signal)
+			switch s {
+			case unix.SIGUSR1:
+				if checkpointPath != "" && !checkpointing.Swap(true) {
+					if err := saveCheckpoint(k, checkpointPath); err != nil {
+						log.Warningf("Checkpoint failed: %v", err)
+					}
+					checkpointing.Store(false)
+				}
+			default:
+				k.SendExternalSignal(&linux.SignalInfo{Signo: int32(s)}, "host")
+				k.TaskSet().Kill(linux.WaitStatusTerminationSignal(linux.Signal(s)))
+			}
+		}
+	}()
 
 	// Start the restored kernel — resumes all saved tasks.
 	if err := k.Start(); err != nil {
@@ -842,6 +864,10 @@ func createNetworkStack(clock tcpip.Clock, k *kernel.Kernel, netMode string) *ne
 							fatal("setgid(%d): %v", gid, err)
 						}
 						if err := unix.Setgroups([]int{gid}); err != nil {
+							log.Warningf("setgroups: %v", err)
+						}
+					} else {
+						if err := unix.Setgroups([]int{}); err != nil {
 							log.Warningf("setgroups: %v", err)
 						}
 					}

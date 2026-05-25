@@ -55,13 +55,6 @@ static void copyStatePageGPRegs(hv_vcpu_t vcpu, const void *statePage, uint64_t 
     for (int i = 18; i < 31; i++) buf[i] = sp[i];
 }
 
-// writeStatePageGPRegs copies X0-X30 from a uint64[31] buffer into
-// the state page. The ERET stub loads registers from it in-VM.
-static void writeStatePageGPRegs(void *statePage, const uint64_t *buf) {
-    uint64_t *sp = (uint64_t *)statePage;
-    for (int i = 0; i < 31; i++) sp[i] = buf[i];
-}
-
 // saveGPRegs saves X0-X30 from the vCPU into a uint64[31] buffer.
 // Single CGO call replaces 31 individual hv_vcpu_get_reg calls.
 static void saveGPRegs(hv_vcpu_t vcpu, uint64_t *buf) {
@@ -75,12 +68,6 @@ static void loadGPRegs(hv_vcpu_t vcpu, const uint64_t *buf) {
     for (int i = 0; i < 31; i++) {
         hv_vcpu_set_reg(vcpu, (hv_reg_t)(HV_REG_X0 + i), buf[i]);
     }
-}
-
-// loadReturnRegs loads only X0 (syscall return value) into the vCPU.
-// Used after syscall exits where only X0 changes.
-static void loadReturnRegs(hv_vcpu_t vcpu, uint64_t x0) {
-    hv_vcpu_set_reg(vcpu, HV_REG_X0, x0);
 }
 
 // loadFPRegs loads all 32 SIMD/FP Q registers plus FPCR/FPSR into
@@ -416,9 +403,8 @@ func (m *machine) setupSharedMemory() error {
 	// Sigreturn trampoline immediately follows at 0x804.
 	binary.LittleEndian.PutUint32(vectors[0x800:], 0xd69f03e0) // ERET
 
-	// ERET stub at 0x810: TLBI, load GP regs from state page, ERET.
-	// Host writes GP regs to state page. LDP chain loads them in-VM.
-	// If LDP faults (cold TTBR1 TLB) → 0x200 → TLBI+ERET → retry.
+	// ERET stub at 0x810: TLBI ASIDE1IS by current ASID, then ERET.
+	// GP regs are loaded via HVF API (loadGPRegs) before entry.
 	{
 		off := 0x810
 		put := func(instr uint32) {
