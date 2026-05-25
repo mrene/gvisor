@@ -47,7 +47,7 @@ type vCPU struct {
 	exit        *C.hv_vcpu_exit_t // Exit information (mapped by HVF)
 	tid         uint64            // OS thread ID that owns this vCPU
 	machine     *machine          // Parent machine (shared resources)
-	asidCounter    uint32 // Incrementing ASID for TLB invalidation
+	asidCounter    uint64 // Incrementing ASID for TLB invalidation
 	asidWrapped    bool   // True when ASID just wrapped (need full TLBI)
 	fpLoaded      bool // FP regs loaded at least once
 	saveFP        bool // Save FP on next saveRegisters call
@@ -145,7 +145,7 @@ func newMachine() (*machine, error) {
 		C.free(dispMem)
 		return nil, fmt.Errorf("mapping dispatch page IPA: %w", err)
 	}
-	dispKVA := uint64(kernelVABase) + 0x100000 // 1MB above base, before state pages
+	dispKVA := uint64(kernelVABase) + 0x200000 // 2MB above base (state pages use 0x4000 + id*16K, max ~1MB at 64 vCPUs)
 	if err := kpt.mapPage(dispKVA, dispIPA, false /* read-only exec */); err != nil {
 		C.free(dispMem)
 		return nil, fmt.Errorf("mapping dispatch in kernel PT: %w", err)

@@ -570,7 +570,7 @@ func (c *vCPU) loadRegisters(ac *arch.Context64, skipAll bool) {
 	// in the vCPU between exits — the sentry never touches it.
 	if !c.fpLoaded {
 		fpData := ac.FloatingPointData()
-		if fpData != nil && len(*fpData) >= 520 {
+		if fpData != nil && len(*fpData) >= 528 {
 			C.loadFPRegs(c.vcpuID, unsafe.Pointer(&(*fpData)[8]))
 			runtime.KeepAlive(fpData)
 		}
@@ -625,7 +625,7 @@ func (c *vCPU) saveRegisters(ac *arch.Context64) {
 	// which may trigger signal delivery that needs FP context.
 	if c.saveFP {
 		fpData := ac.FloatingPointData()
-		if fpData != nil && len(*fpData) >= 520 {
+		if fpData != nil && len(*fpData) >= 528 {
 			C.saveFPRegs(c.vcpuID, unsafe.Pointer(&(*fpData)[8]))
 			runtime.KeepAlive(fpData)
 		}

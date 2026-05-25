@@ -192,8 +192,11 @@ func (c *hvfContext) Switch(
 		return si, at, err
 	}
 
-	// Reset FP loaded flag — vCPU may be reused for a different task.
-	vcpu.fpLoaded = false
+	// Reset FP loaded flag if this vCPU was used by a different context
+	// (the sentry may have modified FP state for signal delivery).
+	if c.lastVCPU != vcpu {
+		vcpu.fpLoaded = false
+	}
 	c.lastVCPU = vcpu
 
 	// Write signal mask to state page for in-VM sigprocmask handler.
@@ -275,7 +278,7 @@ func (c *hvfContext) Switch(
 				// Skip FP save — syscall dispatch doesn't touch FP.
 				if hvcImm == 9 {
 					vcpu.gpInStatePage = true
-					vcpu.saveFP = false
+					vcpu.saveFP = true
 					vcpu.saveRegisters(ac)
 					t3 := time.Now()
 					statSwitchCount.Add(1)
