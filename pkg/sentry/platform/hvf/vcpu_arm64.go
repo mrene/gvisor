@@ -600,6 +600,9 @@ func (c *vCPU) saveRegisters(ac *arch.Context64) {
 		// survive even if the STP chain faulted and retried.
 		regs.Pc = regs.Regs[17]
 		regs.Pstate = regs.Regs[18] &^ 0xf
+		regs.Regs[16] = 0
+		regs.Regs[17] = 0
+		regs.Regs[18] = 0
 	} else {
 		regs.Pc = c.getSysReg(C.HV_SYS_REG_ELR_EL1)
 		regs.Pstate = c.getSysReg(C.HV_SYS_REG_SPSR_EL1) &^ 0xf
