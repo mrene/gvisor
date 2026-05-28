@@ -38,10 +38,11 @@ fast-path syscalls entirely in-VM without a VM exit.
    CPSR     = 0x3C5                  // EL1h + DAIF masked (entry stub)
    PC       = vectors + 0x810       // TLB flush + ERET stub
 
- On vCPU exit (save):
-   Pstate = SPSR_EL1 & ~0x3CF       // Clear mode + DAIF (already EL0t)
-   PC     = ELR_EL1                  // Guest PC at exception
-   SP     = SP_EL0                   // Guest stack pointer
+ On vCPU exit (save, STP chain path):
+   Pstate = X18 & ~0xF              // Saved by MRS X18, SPSR_EL1 before STP
+   PC     = X17                     // Saved by MRS X17, ELR_EL1 before STP
+   SP     = SP_EL0                  // Guest stack pointer
+   X16-X18 zeroed                   // Clobbered by handler, cleared for security
 ```
 
 The entry stub runs at EL1 (CPSR=0x3C5) to execute TLBI, then ERETing
@@ -56,11 +57,12 @@ A shared exception vector table is mapped at IPA 0 in every address space.
 The lower-EL sync vector (0x400) branches to a dispatch code page mapped in
 TTBR1 (kernel VA space) that handles 10 syscalls entirely at EL1:
 
-**Table-dispatch syscalls** (7): getpid, gettid, getuid, getgid, geteuid,
-getegid, clock_gettime — return values from a per-vCPU state page.
+**Table-dispatch syscalls** (7): getpid, getppid, getuid, geteuid,
+getgid, getegid, gettid — return values from patchable MOVZ
+instructions in the shared vectors page.
 
 **Extended-dispatch syscalls** (3): sched_yield, getpgid, getsid —
-simple operations using EL1 register access.
+simple operations using EL1 register access and patchable MOVZ.
 
 Unhandled syscalls save registers to the state page via STP chain and exit
 via HVC #9 for sentry dispatch.
@@ -69,7 +71,7 @@ via HVC #9 for sentry dispatch.
 |----|-----------|---------------|
 | 0x15 | SVC (syscall) | Fast-path in EL1 or HVC #9 exit |
 | 0x24 | Data abort (lower EL) | `HandleUserFault` -> page table update |
-| 0x25 | Data abort (current EL) | `HandleUserFault` -> page table update |
+| 0x25 | Data abort (current EL) | Re-enter vCPU (0x200 handler resolves) |
 | 0x20 | Instruction abort | `HandleUserFault` -> map code page |
 | 0x18 | MSR/MRS trap | `emulateSysreg` -> ID register emulation |
 
@@ -101,18 +103,20 @@ With `--page16k`: 16K granule, 4-level walk (L0=2, L1/L2/L3=2048 entries each).
 ### Dual-TTBR Memory Model
 
 TTBR0 (lower half): per-process guest memory, switched on context switch.
-TTBR1 (upper half): shared sentry kernel memory (Go heap, stacks, dispatch
-code, state pages). Mapped once, updated as heap grows.
+TTBR1 (upper half): shared sentry kernel memory (vectors page, dispatch
+code page, per-vCPU state pages). All C-allocated via `posix_memalign`.
+Mapped once during init, extended when new vCPUs are created.
 
-### Copy-on-Write
+### Write Protection
 
 The AP[2] bit (bit 7) in L3 entries controls write permission:
 - AP[2]=0: read-write (normal pages)
-- AP[2]=1: read-only (COW pages after fork)
+- AP[2]=1: read-only
 
-On fork, parent pages become read-only. Write faults trigger COW:
-guest faults -> `HandleUserFault` -> `breakCopyOnWriteLocked` -> allocate
-new page, copy data, remap writable.
+Copy-on-write is handled by the gVisor mm layer, not the platform.
+On fork, child gets a new AddressSpace. Pages are mapped on-demand
+via page faults (`HandleUserFault` → `MapFile`). The mm layer
+allocates new MemoryFile pages for COW breaks.
 
 ### TLB Invalidation
 
@@ -141,9 +145,11 @@ the state page. The sentry reads X17 from the vCPU API (guest PC) and
 X18 from the state page (guest PSTATE).
 
 HVF may also exit with EC=0x25 (current-EL data abort) instead of
-routing through the 0x200 vector. The sentry handles this by
-re-entering the vCPU with `skipAll`, letting the 0x200 handler
-resolve the fault in-VM on the next run.
+routing through the 0x200 vector. The sentry re-enters the vCPU
+with `skipAll` for translation faults (DFSC 0x04-0x07), with a
+retry limit of 100. Permission faults deliver SIGSEGV. The
+`skipAll` path restores ELR_EL1/SPSR_EL1 from `ac.Regs` to
+prevent stale values from corrupted 0x200 handler state.
 
 ## IPA Space Layout
 
@@ -219,6 +225,7 @@ Key adaptations for macOS:
   func as `state:"nosave"`
 - Gofer reconnection via `CtxRestoreFilesystemFDMap`
 - Stdio FD remapping on restore
+- Signal forwarding (SIGINT/SIGTERM/SIGUSR1) active after restore
 
 ## Known Limitations
 

@@ -686,7 +686,7 @@ Total: **19/19 packages**, 114 packages installed, 314 MiB.
 
 ### Automated Test Suite
 
-Run: `./cmd/sentrydarwin/test.sh [rootfs_path]`
+Run: `python3 cmd/sentrydarwin/test.py [rootfs_path]`
 
 **97 tests** (95-97 pass consistently, 0-2 timing-sensitive flakes) on Alpine
 3.21 with python3, jq, and GraalVM native-image. Multi-threaded programs,
