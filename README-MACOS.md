@@ -71,6 +71,19 @@ cp bazel-bin/cmd/sentrydarwin/sentrydarwin_/sentrydarwin .
 codesign -s - --entitlements cmd/sentrydarwin/entitlements.plist -f sentrydarwin
 ```
 
+Or build with Nix; this runs the same Bazel build (nixpkgs' Bazel 8, the
+macOS 26 SDK) and signs the binary with the Hypervisor entitlement:
+
+```bash
+nix build .#sentrydarwin   # result/bin/sentrydarwin
+```
+
+The flake fetches Bazel's external repositories once, with `bazel vendor`, into
+a fixed-output derivation, then builds offline. Nix reuses that derivation
+until its hash changes, so after changing `MODULE.bazel`, `go.mod` or `go.sum`,
+set `outputHash` in `flake.nix` to `lib.fakeHash`, build, and paste the hash
+Nix reports. Nix only sees files tracked by git (`git add -N` new files).
+
 ### Flags
 
 | Flag | Description |

@@ -31,6 +31,9 @@ archive_override(
         "//tools:rules_go_sdk.patch",
         "//tools:rules_cgo.patch",
         "//tools:rules_go_export.patch",
+        # Bazel's module extension facts are immutable; without this, go_sdk
+        # fails to evaluate whenever MODULE.bazel.lock lacks the SDK facts.
+        "//tools:rules_go_facts.patch",
     ],
     url = "https://github.com/bazel-contrib/rules_go/releases/download/v0.57.0/rules_go-v0.57.0.zip",
 )

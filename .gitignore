@@ -11,4 +11,4 @@
 /test/kubernetes/gvisor-injection-admission-webhook.yaml
 result
 result-*
-sentrydarwin
+/sentrydarwin
