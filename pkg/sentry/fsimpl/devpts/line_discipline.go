@@ -110,6 +110,12 @@ type lineDiscipline struct {
 	// numReplicas is the number of replica file descriptors.
 	numReplicas int
 
+	// replicaClosed is set when the last open replica file descriptor is
+	// closed and cleared when one is opened, like Linux's TTY_OTHER_CLOSED.
+	// While set, master reads fail with EIO and the master polls HUP. Before
+	// any replica is opened, master reads block instead.
+	replicaClosed bool
+
 	// masterWaiter is used to wait on the master end of the TTY.
 	masterWaiter waiter.Queue
 
@@ -243,7 +249,7 @@ func (l *lineDiscipline) masterReadiness() waiter.EventMask {
 	if l.packet && l.packetStatus != 0 {
 		res |= waiter.EventPri | waiter.ReadableEvents
 	}
-	if l.numReplicas == 0 {
+	if l.replicaClosed {
 		res |= waiter.EventHUp
 	}
 	l.termiosMu.RUnlock()
@@ -353,6 +359,7 @@ func (l *lineDiscipline) replicaOpen() {
 	l.termiosMu.Lock()
 	defer l.termiosMu.Unlock()
 	l.numReplicas++
+	l.replicaClosed = false
 }
 
 // replicaClose is called when a replica file descriptor is closed.
@@ -360,6 +367,7 @@ func (l *lineDiscipline) replicaClose() {
 	l.termiosMu.Lock()
 	l.numReplicas--
 	notify := l.numReplicas == 0
+	l.replicaClosed = notify
 	l.termiosMu.Unlock()
 	if notify {
 		l.masterWaiter.Notify(waiter.EventHUp)

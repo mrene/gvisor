@@ -30,11 +30,22 @@ import (
 var UnixDirentMaxSize = int(unsafe.Sizeof(unix.Dirent{}))
 
 // Utimensat is a convenience wrapper to make the utimensat(2) syscall. It
-// additionally handles empty name.
+// additionally handles empty name, which operates on dirFd itself.
 //
 // On macOS, this uses the utimensat function from x/sys/unix rather than a
-// direct syscall, since SYS_UTIMENSAT is not exposed as a constant.
+// direct syscall, since SYS_UTIMENSAT is not exposed as a constant. macOS's
+// utimensat requires a path and x/sys/unix has no futimens, so an empty name
+// operates on the file's current path, from fcntl(F_GETPATH), without
+// following a final symlink.
 func Utimensat(dirFd int, name string, times [2]unix.Timespec, flags int) error {
+	if name == "" {
+		var path [unix.PathMax]byte
+		if _, _, errno := unix.Syscall(unix.SYS_FCNTL, uintptr(dirFd), unix.F_GETPATH, uintptr(unsafe.Pointer(&path[0]))); errno != 0 {
+			return syserr.FromHost(errno).ToError()
+		}
+		dirFd, name = unix.AT_FDCWD, unix.ByteSliceToString(path[:])
+		flags |= unix.AT_SYMLINK_NOFOLLOW
+	}
 	// Use the Go wrapper which handles the syscall properly on darwin.
 	if err := unix.UtimesNanoAt(dirFd, name, []unix.Timespec{times[0], times[1]}, flags); err != nil {
 		if errno, ok := err.(unix.Errno); ok {

@@ -355,7 +355,7 @@ func (mm *MemoryManager) getVecVMAsLocked(ctx context.Context, ars hostarch.Addr
 //
 // guardBytes is equivalent to Linux's stack_guard_gap after upstream
 // 1be7107fbe18 "mm: larger stack guard gap, between vmas".
-const guardBytes = 256 * hostarch.PageSize
+const guardBytes = 256 * hostarch.GuestPageSize
 
 // unmapLocked unmaps all addresses in ar and returns the resulting gap in
 // mm.vmas.
@@ -372,7 +372,7 @@ const guardBytes = 256 * hostarch.PageSize
 //   - ar must be page-aligned.
 func (mm *MemoryManager) unmapLocked(ctx context.Context, ar hostarch.AddrRange, droppedIDs []memmap.MappingIdentity) (vmaGapIterator, []memmap.MappingIdentity) {
 	if checkInvariants {
-		if !ar.WellFormed() || ar.Length() == 0 || !ar.IsPageAligned() {
+		if !ar.WellFormed() || ar.Length() == 0 || !ar.IsGuestPageAligned() {
 			panic(fmt.Sprintf("invalid ar: %v", ar))
 		}
 	}
@@ -398,7 +398,7 @@ func (mm *MemoryManager) unmapLocked(ctx context.Context, ar hostarch.AddrRange,
 //   - ar must be page-aligned.
 func (mm *MemoryManager) removeVMAsLocked(ctx context.Context, ar hostarch.AddrRange, droppedIDs []memmap.MappingIdentity) (vmaGapIterator, []memmap.MappingIdentity) {
 	if checkInvariants {
-		if !ar.WellFormed() || ar.Length() == 0 || !ar.IsPageAligned() {
+		if !ar.WellFormed() || ar.Length() == 0 || !ar.IsGuestPageAligned() {
 			panic(fmt.Sprintf("invalid ar: %v", ar))
 		}
 	}

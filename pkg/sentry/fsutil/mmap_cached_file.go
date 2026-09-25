@@ -78,7 +78,7 @@ const (
 )
 
 func pagesInChunk(fr memmap.FileRange, chunkStart uint64) int64 {
-	return int64(fr.Intersect(memmap.FileRange{chunkStart, chunkStart + chunkSize}).Length() / hostarch.PageSize)
+	return int64(fr.Intersect(memmap.FileRange{chunkStart, chunkStart + chunkSize}).Length() / hostarch.GuestPageSize)
 }
 
 // +stateify savable
@@ -278,8 +278,9 @@ func (f *MmapCachedFile) forEachMappingBlockLocked(fr memmap.FileRange, write bo
 			}
 		}
 	}
+	writable := write || mapChunksWritable
 	prot := unix.PROT_READ
-	if write {
+	if writable {
 		prot |= unix.PROT_WRITE
 	}
 	chunkStart := fr.Start &^ chunkMask
@@ -300,7 +301,7 @@ func (f *MmapCachedFile) forEachMappingBlockLocked(fr memmap.FileRange, write bo
 			if errno != 0 {
 				return errno
 			}
-			m = mapping{addr, write}
+			m = mapping{addr, writable}
 			f.mappings[chunkStart] = m
 		} else if write && !m.writable {
 			addr, _, errno := unix.Syscall6(

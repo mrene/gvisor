@@ -13,7 +13,7 @@
 |---------|--------|
 | HVF platform (Hypervisor.framework) | Working |
 | ARM64 page tables (4K default, per-MM, COW) | Working |
-| Fork/exec with copy-on-write | Working (shadow pages fix PA coherency) |
+| Fork/exec with copy-on-write | Working |
 | Signal delivery (SIGURG, SIGINT, etc.) | Working |
 | Multi-CPU (14 vCPUs, GOMAXPROCS=22) | Working |
 | Gofer filesystem (host dir passthrough) | Working |
@@ -27,7 +27,7 @@
 | HTTP/HTTPS downloads | Working (up to 17MB verified) |
 | Package install (`apk add`) | Working (68+ packages) |
 | Installed packages | Working — 50/50 test pass rate |
-| Direct TLBI at EL1 | Working (TLB coherency via VMALLE1IS) |
+| TLB maintenance at EL1 | Working (TLBI ASIDE1IS on every guest entry) |
 | VDSO (clock_gettime fast path) | Working (~5ns/call via CNTVCT_EL0) |
 | directfs mode (bypass lisafs RPC) | Working (`--directfs` flag) |
 | ICMP ping (unprivileged) | Working (SOCK_DGRAM, no raw socket) |
@@ -38,7 +38,7 @@
 | 4K guest pages (default) | Working (IPA granule 4K, TG0=4K) |
 | Split page model (4K guest / 16K host) | Working (74/77 Alpine tests) |
 | GraalVM Native Image (Java AOT) | Working |
-| FEX-Emu (x86_64 emulation) | Partial — [COW fault loop](docs/FEX-EMU.md) |
+| FEX-Emu (x86_64 emulation) | Partial — not retested since the [fault loop](docs/FEX-EMU.md) fix |
 | Java / JVM (HotSpot JIT) | Blocked — [upstream JDK bug](docs/MRS-TRAPPING.md) |
 
 ## Quick Start
@@ -76,6 +76,13 @@ codesign -s - --entitlements cmd/sentrydarwin/entitlements.plist -f sentrydarwin
 | Flag | Description |
 |------|-------------|
 | `--rootfs <dir>` | Host directory to use as guest root filesystem (via gofer) |
+| `--nix-store <dir>` | Mount the host Nix store read-only at guest `/nix/store` (default: `/nix/store`; empty disables) |
+| `--nix-store-overlay` | Make guest `/nix/store` writable: the host store is the read-only lower layer of an overlay whose upper layer is in-memory tmpfs. Guest builds never reach the host store and are discarded on exit |
+| `--nix-build` | Run the Nix derivation build described by the `build.json` given as the final argument (Nix's `external-builders` protocol; see [Building with Nix](#building-with-nix)) |
+| `--nix-build-sh <path>` | With `--nix-build`, make guest `/bin/sh` a symlink to `<path>`, e.g. a static busybox in the Nix store |
+| `--cwd` | Mount the host working directory read-write at the same guest path and start there (default: on; ignored with `--rootfs`; `--cwd=false` disables) |
+| `--home` | Mount `$HOME` read-write at the same guest path and set the guest `HOME` to it |
+| `--mount <host>[:<guest>][:ro\|:rw]` | Mount a host directory in the guest (guest path defaults to the host path; read-write unless `:ro`; repeatable) |
 | `--net`, `--net=proxy` | Enable host networking via userspace proxy (default, no root) |
 | `--net=utun` | Enable host networking via utun (requires root) |
 | `--net=vmnet` | Enable host networking via socket_vmnet (no root, needs daemon) |
@@ -84,7 +91,6 @@ codesign -s - --entitlements cmd/sentrydarwin/entitlements.plist -f sentrydarwin
 | `--strace` | Enable system call tracing |
 | `--directfs` | Enable directfs mode (bypass lisafs RPC for host file access) |
 | `--cpus <n>` | Number of vCPUs (0 = auto-detect, default) |
-| `--mach-memory` | Experimental: use Mach anonymous memory for MemoryFile |
 | `--keep-root` | Keep root privileges after utun setup (default: drop to SUDO_UID) |
 | `--page4k` | Use 4K guest pages (default: on). Linux ARM64 standard. |
 | `--profile <file>` | Write per-Switch() timing stats to file on exit. |
@@ -156,6 +162,149 @@ $ sentrydarwin --strace --rootfs alpine-rootfs /bin/sh -c 'echo hello' 2>&1 | gr
 $ sentrydarwin ./my-static-linux-arm64-binary arg1 arg2
 ```
 
+### Sharing host directories
+
+Without `--rootfs`, the guest root is an empty tmpfs plus `/nix/store`,
+`/proc`, `/dev`, and `/tmp`. The host working directory is mounted at its host
+path and the guest starts there, so relative paths behave as on the host:
+
+```console
+$ cd ~/src/project
+$ sentrydarwin /nix/store/...-eza-0.23.5/bin/eza -l src
+$ sentrydarwin --home /nix/store/...-busybox/bin/busybox sh -c 'echo $HOME; pwd'
+/Users/me
+/Users/me/src/project
+$ sentrydarwin --mount ~/data:/data:ro --mount /Volumes/scratch ./tool
+```
+
+Host paths keep their host names in the guest (for example
+`/Users/me/src/project`); a working directory already visible through another
+mount (`--home`, `--mount`, or `/nix/store`) is not mounted again. Mounts over
+`/`, `/proc`, or `/dev` are rejected. Directories protected by macOS privacy
+settings (such as `~/Documents`) fail with "operation not permitted" unless the
+terminal has access to them.
+
+### A tool environment
+
+The empty guest root has no `/bin/sh`, `/usr/bin/env` or anything on `PATH`.
+[`nix/flake.nix`](nix/flake.nix) builds a Linux tool environment (bash,
+coreutils, git, ripgrep, fd, ..., and the `nvim` package of its `dotfiles`
+input, a local flake: point it at yours or use nixpkgs `neovim`) and a wrapper, `sb`, that puts it
+on `PATH`, sets `SHELL`, links `/bin/sh` and `/usr/bin/env` into the guest
+root, trusts all git repositories (shared files belong to your uid while the
+guest runs as root), and runs a command (default: a login bash). Its `nix run` app starts
+`sb` under `sentrydarwin` (from `PATH`, or `$SENTRYDARWIN`, with extra flags
+from `$SENTRYDARWIN_FLAGS`); building it needs the [Nix
+builder](#building-with-nix). Until `nix/` is tracked by git, refer to it as
+`path:./nix`:
+
+```console
+$ nix run path:./nix                      # login bash
+$ nix run path:./nix -- nvim file.go      # :!, system() and :terminal work
+$ SENTRYDARWIN_FLAGS="--mount $HOME/src/project:ro" nix run path:./nix -- git -C ~/src/project log -1
+$ nix build 'path:./nix#packages.aarch64-linux.sb' -o sb && sentrydarwin ./sb/bin/sb
+```
+
+### Building with Nix
+
+sentrydarwin can be Nix's builder for `aarch64-linux`, so that the host's own
+`nix build` builds Linux derivations:
+
+```console
+$ nix build nixpkgs#legacyPackages.aarch64-linux.hello
+```
+
+Host Nix evaluates, substitutes and registers paths as usual. For each
+`aarch64-linux` derivation it runs `sentrydarwin --nix-build BUILD_JSON`
+(the [`external-builders`](https://determinate.systems/blog/changelog-determinate-nix-384/)
+protocol of Determinate Nix). sentrydarwin then:
+
+- mounts the host store at `/nix/store` behind an in-memory copy-on-write
+  layer, so the builder can read every store path but not modify one;
+- shares the host build directory at `/build` and creates the `/etc/passwd`,
+  `/etc/group` and `/etc/hosts` that Nix's Linux sandbox provides, plus
+  `/bin/sh` (`--nix-build-sh`);
+- runs the builder as root in the guest, with exactly Nix's environment and
+  loopback-only networking, except for fixed-output derivations (fetchers),
+  which get the proxy network and the host's `/etc/resolv.conf`;
+- copies the declared outputs from the copy-on-write layer into the store
+  and exits with the builder's status.
+
+Sentry messages go to `sentrydarwin.log` in the build's top directory (kept
+with `--keep-failed`) instead of the build log.
+
+Setup, with the Nix daemon (edit `/etc/nix/nix.custom.conf` on Determinate
+Nix, `/etc/nix/nix.conf` otherwise):
+
+```console
+# The daemon starts builders as a build user (e.g. _nixbld12), which cannot
+# read your home directory: install the binary elsewhere (install keeps the
+# signature). Also a /bin/sh for builders, kept alive by a GC root.
+$ sudo install -m 755 ./sentrydarwin /usr/local/bin/sentrydarwin
+$ nix build --out-link ~/.local/state/sentrydarwin-sh \
+    nixpkgs#legacyPackages.aarch64-linux.pkgsStatic.busybox
+$ readlink ~/.local/state/sentrydarwin-sh    # /nix/store/...-busybox-static-...
+
+# nix.custom.conf
+extra-experimental-features = external-builders
+external-builders = [{"systems":["aarch64-linux"],"program":"/usr/local/bin/sentrydarwin","args":["--nix-build","--nix-build-sh=/nix/store/...-busybox-static-aarch64-unknown-linux-musl-1.37.0/bin/busybox"]}]
+
+$ sudo launchctl kickstart -k system/systems.determinate.nix-daemon
+```
+
+Without changing the daemon, the same works with a local store you own,
+e.g. to try it out (the busybox path must be in that store too):
+
+```console
+$ nix copy --no-check-sigs --to /private/tmp/store /nix/store/...-busybox-static-...
+$ nix build --store /private/tmp/store --extra-experimental-features external-builders \
+    --option external-builders '[{"systems":["aarch64-linux"],"program":"'$PWD'/sentrydarwin","args":["--nix-build","--nix-build-sh=/nix/store/...-busybox-static-.../bin/busybox"]}]' \
+    nixpkgs#legacyPackages.aarch64-linux.hello
+```
+
+Tested: `hello` 2.12.3 builds from source (configure, make, tests, install,
+fixup) in about 90 seconds with the local-store form, and its NAR hash
+matches the cache.nixos.org binary. With the daemon, builders run on the host
+as a `nixbld` build user (root in the guest), and Hypervisor.framework needs
+nothing more for that user. Once `external-builders` is enabled in the
+daemon's configuration, a trusted user can point a single command at another
+binary without reinstalling, e.g. to try a new build (it must be readable by
+the build users, so not under `$HOME`):
+
+```console
+$ NIX_CONFIG='external-builders = [{"systems":["aarch64-linux"],"program":"/private/tmp/sentrydarwin-test/sentrydarwin","args":["--nix-build","--nix-build-sh=/nix/store/...-busybox-static-.../bin/busybox"]}]' \
+    nix build nixpkgs#legacyPackages.aarch64-linux.hello
+```
+
+#### Nix inside the sandbox
+
+Alternatively, with `--nix-store-overlay` the guest can run its own
+single-user, unsandboxed Nix. Its database starts empty, so register the host
+paths it may use first, and results stay in the in-memory layer:
+
+```console
+# Host: find hello's inputs, fetch them, and export their registrations.
+$ drv=$(nix eval --raw nixpkgs#legacyPackages.aarch64-linux.hello.drvPath)
+$ nix build --no-link --max-jobs 0 $(nix-store -q --references $drv | grep '\.drv$' | sed 's/$/^*/')
+$ nix-store --dump-db $(nix-store -qR $(nix-store -q --references $drv | grep '\.drv$' | xargs nix-store -q --outputs) \
+    $(nix eval --raw nixpkgs#path)) > closure.reg
+
+# Guest: /bin/sh for make and configure scripts, Nix settings, registrations.
+$ sentrydarwin --nix-store-overlay /nix/store/...-busybox-static-.../bin/busybox sh -c '
+    B=/nix/store/...-busybox-static-.../bin/busybox
+    $B mkdir -p /bin && $B ln -s $B /bin/sh
+    export PATH=/nix/store/...-nix-2.34.8/bin:/bin
+    nix-store --load-db < closure.reg
+    nix-build /nix/store/...-source -A hello --no-out-link \
+      --option build-users-group "" --option sandbox false --option substituters ""'
+```
+
+This way, 10 of 10 full `hello` builds succeeded. Earlier, about half failed
+with memory corruption (`cc1` segfaults, `stack smashing detected` in the
+builder shell). The causes were guest registers discarded on interrupts,
+FP/SIMD state leaking between tasks, and 16K rounding of 4K memory
+operations.
+
 ## Architecture
 
 ![HVF Architecture](g3doc/architecture_guide/macos/hvf-architecture.png "HVF platform architecture on macOS.")
@@ -191,10 +340,8 @@ The port replaces gVisor's KVM platform with a Hypervisor.framework (HVF) platfo
 │  ┌─── HVF VM (ARM64) ──┴───────────────────────────────┐   │
 │  │                                                       │   │
 │  │  EL1: Exception Vectors (0x400)                       │   │
-│  │    ├─ ESR_EL1 → EC=0x15 (SVC)?                       │   │
-│  │    ├─ Fast-path table (172-178): MOVZ+ERET  ~0.1µs   │   │
-│  │    ├─ Extended (124,155,156,96): ERET       ~0.1µs   │   │
-│  │    └─ Other: HVC #9 → VM exit              ~4µs     │   │
+│  │    ├─ ESR_EL1 → EC=0x15 (SVC): save regs, HVC #9     │   │
+│  │    └─ Other exceptions: HVC #8 → VM exit     ~4µs     │   │
 │  │                                                       │   │
 │  │  EL1: Dispatch Code Page (TTBR1, optional)            │   │
 │  │    └─ Go asm / C compiled handlers via BLR            │   │
@@ -203,7 +350,7 @@ The port replaces gVisor's KVM platform with a Hypervisor.framework (HVF) platfo
 │  │    ├─ GP regs (X0-X30)     0x000                      │   │
 │  │    ├─ ESR/SP/TPIDR/PC      0x100                      │   │
 │  │    ├─ Signal mask           0x128                      │   │
-│  │    └─ Persistent state      0x200 (pid,tid,brk,uid..) │   │
+│  │    └─ Dispatch page VA      0x200                      │   │
 │  │                                                       │   │
 │  │  EL0: Guest Application                               │   │
 │  │    └─ Linux ARM64 ELF (musl/glibc)                    │   │
@@ -220,17 +367,37 @@ The port replaces gVisor's KVM platform with a Hypervisor.framework (HVF) platfo
 1. Host loads guest registers via HVF API (loadGPRegs, ~800ns)
 2. ERET stub: TLBI ASIDE1IS + ERET → drops to EL0
 3. Guest runs until SVC/fault
-4. EL1 handler: reads ESR_EL1, dispatches fast-path or HVC exit
-5. Host saves registers (saveGPRegs, ~800ns; FP save only on faults)
+4. EL1 handler: reads ESR_EL1 and exits via HVC (#9 for SVC, #8 for other
+   exceptions). No syscall is handled inside the VM, so every return to EL0
+   goes through the ERET stub and every EL1 handler path ends in an exit.
+5. Host saves registers (saveGPRegs, ~800ns, plus FP/SIMD)
+
+**Asynchronous exits.** `hv_vcpus_exit` (interrupting a task for a signal,
+or `flushTLB` kicking a vCPU) stops the vCPU wherever it is. `Switch` keeps
+the exact guest state: at EL0 it saves the registers from `HV_REG_PC`/`CPSR`
+(and FP/SIMD) before returning `ErrContextInterrupt`; in an entry stub the
+`arch.Context64` is still the state being entered; inside an EL1 exception
+handler it resumes the vCPU unchanged until the handler's HVC exit. Vtimer and
+unknown exits also resume unchanged. Previously every cancel re-entered from
+the last loaded state, replaying user code after its memory effects (e.g.
+`stack smashing detected` in a shell receiving SIGCHLD).
+
+**FP/SIMD ownership.** FP registers are only reloaded when needed: each vCPU
+records which context's FP state it holds, and each context records which vCPU
+last held its state. Both must match (and the sentry must not have changed the
+state, see `FullStateChanged`), otherwise the state is loaded from
+`arch.Context64`.
 
 **Key ARM64 state:**
 - TTBR0: per-process page tables (ASID-tagged, rotated each Switch)
 - TTBR1: shared kernel page table (global, vectors + state + dispatch)
 - TPIDR_EL1: per-vCPU state page kernel VA
 - SP_EL1: scratch stack at end of state page
-- VBAR_EL1: IPA 0 (vectors page)
+- VBAR_EL1: VA 0, mapped EL1-only (no EL0 access, EL0 execute-never) in every
+  process page table, so the zero page faults for applications
 - ESR_EL1: readable from EL1 after SVC (EC=0x15)
 - PAN: auto-set on EL0→EL1 exception (use AP[1]=0 or STTR/LDTR)
+- Application PTEs set PXN always and UXN unless the mapping is executable
 
 **EL1 capabilities (proven by el1memtest):**
 - Data read/write via TTBR0 and TTBR1 (AP[1]=0 pages)
@@ -249,45 +416,62 @@ The port replaces gVisor's KVM platform with a Hypervisor.framework (HVF) platfo
 | 0x110 | TPIDR_EL0 | User TLS pointer |
 | 0x128 | sig_mask | Signal mask (synced via SignalMasker) |
 | 0x130 | sig_dirty | Non-zero if EL1 modified mask |
-| 0x200 | pid/tid/brk/uid/gid | Persistent per-task values |
+| 0x200 | dispatch VA | Kernel VA of the dispatch code page |
 
 **Vectors page layout** (16K at IPA 0, shared across all vCPUs):
 
 ```
-0x000-0x07F  Current-EL SP0 sync       HVC #0
-0x080-0x0FF  Current-EL SP0 IRQ        HVC #1
-0x100-0x17F  Current-EL SP0 FIQ        HVC #2
-0x180-0x1FF  Current-EL SP0 SError     HVC #3
-0x200-0x27F  Current-EL SPx sync       MRS X18,ESR; MRS X17,FAR; HVC #4
-0x280-0x37F  Current-EL SPx IRQ/FIQ/SE HVC #5/#6/#7
-0x400-0x47F  Lower-EL sync (el0_sync)  ESR dispatch + fast-path table
-0x480-0x5FF  Lower-EL IRQ/FIQ/SError   HVC #9/#10/#11
-0x600-0x67F  Extended handler           sched_yield, getpgid, getsid,
-                                        slow→HVC #9
-0x800        Bare ERET                  (sigreturn entry point)
-0x804        Sigreturn trampoline       MOV X8,#139; SVC #0
-0x810        ERET stub                  TLBI ASIDE1IS + ERET
-0x828        Full TLBI stub             TLBI VMALLE1IS + ERET (ASID wrap)
+0x000-0x1FF  Current-EL SP0 sync/IRQ/FIQ/SError  HVC #0x10-#0x13
+0x200-0x27F  Current-EL SPx sync       TLBI VMALLE1IS + ERET (TLB retry)
+0x280-0x3FF  Current-EL SPx IRQ/FIQ/SE HVC #0x15-#0x17
+0x400-0x47F  Lower-EL sync (el0_sync)  stash X16-X18; SVC→0x600, other→HVC #8
+0x480-0x5FF  Lower-EL IRQ/FIQ/SError   HVC #0x19-#0x1B
+0x600-0x67F  SVC save path             save X0-X30 to state page, HVC #9
+0x680-0x7FF  Lower-EL AArch32 (unused) HVC #0x1D-#0x1F
+0x810        ERET stub                 TLBI ASIDE1IS + ERET
+0x830        Full TLBI stub            TLBI VMALLE1IS + ERET (ASID wrap)
 ```
+
+Generic vectors exit with HVC #(0x10 + index), distinct from the el0_sync
+exits. Exit HVCs never use immediate 0: HVF answers `HVC #0` itself, without
+exiting, when W0 holds certain SMCCC function IDs (e.g. `0xC1xxxxxx`).
 
 **IPA space layout:**
 
 ```
-0x00000-0x03FFF  Vectors page (16K, RX)
-0x04000-0x0FFFF  Reserved
-0x10000-0xFFFFF  Page table pages (PT allocator, RW)
-0x1000000+       Data pages (IPA allocator, RWX)
-                 Dispatch code page, state pages,
-                 guest memory, shadow copies
+0x00000-0x03FFF       Vectors page (16K, RX)
+0x04000-0x0FFFF       Reserved
+0x10000-0xFFFFF       Page table pages (PT allocator, RW)
+0x1000000-512GB       IPA allocator (RWX), one IPA per host page:
+                      dispatch code page, state pages, and guest pages
+                      of files mapped from the host (imported host FDs)
+512GB-1TB             MemoryFile: each 1GB chunk mapped once, on first
+                      use, at 512GB + file offset
 ```
+
+Most guest memory (anonymous memory, page cache, tmpfs) is MemoryFile, so
+guest PTEs point straight at `512GB + offset` without a per-page
+`hv_vm_map` or reference count (`memFileMapper`). A freed MemoryFile page
+keeps its IPA; its stage-1 PTEs are cleared and flushed (`flushTLB`) before
+the page can be reused. Executable mappings of MemoryFile pages invalidate
+the instruction cache every time, since a reused page may hold new code.
+This cut `hv_vm_map` calls for `nix --version` from about 12,000 to about
+400, and its run time by about a third.
 
 ### Page Tables
 
-Sigreturn trampoline at IPA 0x804:
-```asm
- 0x804:  MOV X8, #139     // __NR_rt_sigreturn
- 0x808:  SVC #0            // trap to sentry
-```
+Each process has its own 4-level table (4K granule by default). Every table
+maps the vectors page at VA 0 for EL1 only; signal handlers return through
+the VDSO's `rt_sigreturn` trampoline, as on Linux. Application PTEs carry
+the mapping's permissions: AP[2] for read-only, UXN unless executable, and
+PXN always. Replacing a PTE uses break-before-make and returns the old IPA,
+which is released only after `flushTLB` if the page changed or lost a
+permission.
+
+Before the guest may execute a page, the instruction cache is invalidated
+for it: the page may have been written through the sentry's host mapping,
+and `CTR_EL0.DIC` is 0. For MemoryFile pages this happens on every
+executable mapping; for other pages once per IPA (`prepareExec`).
 
 ### Copy-on-Write Fork
 
@@ -301,7 +485,7 @@ When `fork()` is called:
 
 On first access by the child:
 - Guest faults (no L3 entry) -> `HandleUserFault` -> `mapASLocked` -> `MapFile`
-- The IPA allocator returns the existing IPA for the shared host page
+- The child's PTE points at the same IPA as the parent's (the MemoryFile page's fixed IPA)
 - Page table entry created with AP[2]=1 (read-only) if COW
 
 On write to a COW page:
@@ -521,74 +705,77 @@ uses a split page size model with two constants:
 
 | Constant | Value | Layer | Purpose |
 |----------|-------|-------|---------|
-| `GuestPageSize` | 4096 | Syscall-facing (VMA) | mmap alignment, mprotect granularity, AT_PAGESZ |
-| `PageSize` | 16384 | Host-facing (PMA, MemoryFile) | Physical allocation, HVF mapping, file I/O |
+| `GuestPageSize` | 4096 | Guest-facing (syscalls, VMA, PMA, guest PTEs) | Address/length alignment, AT_PAGESZ |
+| `PageSize` | 16384 | Host-facing (MemoryFile chunks, host mmap) | Host mappings, page-cache fills, fault-around |
 
-On darwin, `GuestPageSize` is set to 4K. All VMA operations (mmap
-addresses, mprotect ranges, munmap boundaries) align to 4K. The PMA
-layer and MemoryFile continue to allocate in 16K chunks internally.
+On darwin, `GuestPageSize` is 4K. Every guest-facing address and length
+(mmap, munmap, mprotect, madvise, mremap, mincore, msync, mlock, brk, the
+stack, shm detach) is validated and rounded in guest pages, and vmas and pmas
+may start and end on any 4K boundary. `PageSize` (16K) is used only where host
+pages matter: MemoryFile chunk and host mappings, gofer page-cache fills, and
+`HandleUserFault`'s fault-around.
 
 **How the layers interact:**
 
 ```
-Syscall layer (4K)          PMA layer (16K)           MemoryFile (16K)
+Syscall layer (4K)          VMA/PMA layer (4K)        MemoryFile / host (16K)
 ┌──────────────┐           ┌──────────────┐          ┌──────────────┐
-│ mmap addr    │──align──→ │ allocate     │──round──→│ fr.Start     │
-│ aligned to   │  to 4K    │ rounds to    │  to 16K  │ aligned to   │
-│ GuestPageSize│           │ PageSize     │          │ GuestPageSize│
+│ addr, length │──round──→ │ vma and pma  │─alloc──→ │ 4K-aligned   │
+│ in guest     │  to 4K    │ boundaries   │          │ ranges in    │
+│ pages        │           │ on 4K        │          │ 16K pages    │
 └──────────────┘           └──────────────┘          └──────────────┘
 ```
 
-**MAP_FIXED behavior:**
+`MAP_FIXED` replaces exactly the requested guest pages, including
+`PROT_NONE` mappings (e.g. Boehm GC's unmap), and `munmap` of a single 4K page
+unmaps exactly that page. Mapping references on host-file chunks
+(`fsutil.MmapCachedFile`) and `MmapFileRefs` are counted in guest pages, so a
+vma split at a 4K boundary cannot drop a chunk while it is still mapped.
 
-`MAP_FIXED` passes the 4K-aligned address directly to the kernel
-without additional rounding. This is critical for programs like
-FEX-Emu and glibc's `ld.so` that rely on precise ELF segment
-placement. Non-fixed mappings are aligned to `GuestPageSize` by the
-VMA layer.
+**HandleUserFault fault-around:** a fault maps the enclosing 16K range,
+clamped to the VMA that contains the faulting address. Adjacent VMAs with
+different permissions are left untouched, and the faulting page is always
+included.
 
-**HandleUserFault fallback:**
-
-When a page fault occurs, `HandleUserFault` first tries to map a full
-16K range (the enclosing `PageSize`-aligned region). If this range
-crosses a VMA boundary, it falls back to mapping a single 4K page at
-the faulting address. This handles cases where adjacent VMAs have
-different permissions or protection flags.
-
-**PMA clamping:**
-
-The PMA layer clamps all allocations to the containing VMA's bounds.
-A 16K physical allocation that would extend past the VMA end is
-truncated. This prevents one VMA's physical pages from leaking into
-an adjacent VMA's address range.
-
-**MemoryFile:**
-
-`MemoryFile` accepts allocations aligned to `GuestPageSize` (4K). The
-backing file offset arithmetic uses 4K granularity for VMA-facing
-operations, while the underlying `mmap` and HVF mappings operate at
-16K boundaries.
-
-**Test results:** 74/77 Alpine tests pass with the split model,
-matching the baseline pass rate.
+**MemoryFile:** allocations and `Decommit` take guest-page-aligned ranges.
+Freed ranges that cover whole host pages are hole-punched; partial host pages
+are zeroed in place, since their other guest pages may be in use.
 
 **Stage-2 and stage-1 configuration:**
 
 The HVF platform uses `hv_vm_config_set_ipa_granule(HV_IPA_GRANULE_4KB)`
 for 4K stage-2 and `TCR_EL1.TG0=0x0` for 4K stage-1 page tables.
-Sub-16K `PROT_NONE` guard pages (from musl/glibc thread stacks) are
-handled by skipping VMA creation -- the absence of a page table entry
-provides equivalent fault behavior.
 
-Use `--page16k` to revert to 16K guest pages if needed.
+**Coherence of host and guest views.** HVF's stage-2 translation follows the
+host mapping (the VM object behind the host VA), not the physical pages it had
+when `hv_vm_map` was called: host and guest stay coherent across host paging,
+compression and hole punching, for both MemoryFile (`MAP_SHARED`) and host file
+(`MAP_PRIVATE`) mappings. Replacing the host mapping behind a live IPA
+(`munmap`, or `mmap` with `MAP_FIXED`) does leave the guest on the old pages,
+so allocator IPAs, which are keyed by host VA, are released before the host
+mapping of their page can change, and MemoryFile chunk mappings, which stay
+mapped at fixed IPAs, are never replaced while the VM runs.
 
-### MAP_PRIVATE for Host Files
+Use `--page16k` to revert to 16K guest pages if needed (currently broken:
+every guest crashes, since `GuestPageSize` is fixed at 4K on darwin).
 
-macOS quarantine (`com.apple.provenance` xattr) prevents `MAP_SHARED` of downloaded files. The gofer's `MapInternal` uses `MAP_PRIVATE` for host file mappings via `pkg/sentry/fsutil/mmap_compat_darwin.go`.
+### Host File Mappings
+
+macOS quarantine (`com.apple.provenance` xattr) prevents `MAP_SHARED` of
+downloaded files, so `fsutil.MmapCachedFile` maps host files `MAP_PRIVATE`
+(`pkg/sentry/fsutil/mmap_compat_darwin.go`), writable from the start so that
+a chunk is never remapped under a live IPA. Writes through such mappings never
+reach the file. sentrydarwin therefore mounts every gofer filesystem with
+`force_page_cache`: application mappings of gofer files use the sentry's page
+cache in MemoryFile, whose dirty pages are written back through the gofer
+(on `msync`, `fsync`, `munmap` and process exit). Only host FDs imported
+directly (redirected stdio, and a command-line program outside every mount)
+still use host mappings.
 
 ### MemoryFile Allocation
 
-`pgalloc.MemoryFile` uses `MAP_SHARED` for its backing store (required for HVF memory coherency). Set in `pkg/sentry/pgalloc/pgalloc_darwin.go`.
+`pgalloc.MemoryFile` is an unlinked temporary file mapped `MAP_SHARED` in 1GB
+chunks (`pkg/sentry/pgalloc/pgalloc_darwin.go`).
 
 ### Gofer Sentry Package
 
@@ -716,7 +903,7 @@ crypto traps, GraalVM not installed). Python test harness with
 | Test Suite | Result |
 |------------|--------|
 | Interactive shell (devpts PTY) | echo, Ctrl+C, Ctrl+Z, bg, fg, job control |
-| Sequential exec (jq 1000×) | 1000/1000 passed (shadow pages) |
+| Sequential exec (jq 1000×) | 1000/1000 passed (with the since-removed shadow pages; not rerun) |
 | Multi-CPU | 14 vCPUs, GOMAXPROCS=22 |
 | directfs mode | 7/7 passed |
 | safecopy fault recovery | 200× rapid reads, no crashes |
@@ -749,7 +936,7 @@ crypto traps, GraalVM not installed). Python test harness with
 - [x] Fix libcrypto hang (safecopy macOS compat, Translate clamp, GOMAXPROCS)
 - [x] Fix dynamically-linked binary crashes (fallocateDecommit, MapInternal clamp)
 - [x] Fix multi-vCPU TLB coherency (IPA stage-2 unmap, epoch kick, BBM, DSB ISH)
-- [x] Fix sequential exec crash (shadow pages for file-backed guest memory)
+- [x] Fix sequential exec crash (was host-VA-keyed IPAs outliving their host mapping; the shadow-page workaround has since been removed)
 - [x] VDSO clock_gettime (~5ns/call via cross-compiled ELF + CNTVCT_EL0)
 - [x] safecopy via Mach exception ports (bypass PAC sigreturn limitation)
 - [x] ICMP ping without raw sockets (SOCK_DGRAM + IP header stripping)
@@ -759,7 +946,7 @@ crypto traps, GraalVM not installed). Python test harness with
 - [x] Host DNS resolver integration (reads /etc/resolv.conf)
 - [x] Package installation from Alpine repos (`apk add`)
 - [x] Drop root privileges after utun/pfctl setup
-- [x] Investigate TLB race root cause (HVF ARM64 lacks guest TLBI API + ASID TLB)
+- [x] Investigate TLB race root cause (the failures came from discarded guest state on asynchronous exits, see [TLB Coherency](#tlb-coherency-hvf-arm64))
 - [x] Interactive shell with TTY support (echo, Ctrl+C, Ctrl+D, ONLCR)
 - [x] socket_vmnet rootless networking (L2 Ethernet via Unix socket)
 - [x] Fix fchown EPERM for symlink/file creation on macOS gofer
@@ -769,7 +956,7 @@ crypto traps, GraalVM not installed). Python test harness with
 - [x] Fix ptrace SYSEMU x0 clobbering on ARM64 (restore OrigR0 before ptrace stop)
 - [x] gVisor-in-gVisor via PTRACE_SYSEMU (nested sentry inside HVF sentry)
 - [x] 48-bit VA (256TB) via 4-level page tables (L0→L1→L2→L3, T0SZ=16)
-- [x] MRS ID register patching in shadow pages (HVF hangs on ID reg reads)
+- [x] MRS ID register patching in shadow pages (removed: every ID register read traps and is emulated)
 - [x] runsc --version runs inside macOS sentry
 - [x] Proxy networking mode (--net=proxy, zero root, zero daemon, pure userspace)
 - [x] Controlling TTY for shell process (shared stdio FDs, job control)
@@ -799,25 +986,36 @@ crypto traps, GraalVM not installed). Python test harness with
 - [x] In-VM ESR_EL1 dispatch (el0_sync classifies SVC vs fault at EL1)
 - [x] 4K pages as default (matching Linux ARM64)
 - [ ] State page via separate TTBR0 page (next approach for register batching)
-- [x] In-VM fast-path syscalls via ERET (10 syscalls, 40x faster, 0.1µs)
+- [x] In-VM fast-path syscalls via ERET (removed: the ID syscalls returned init's PID/TID to every process, and sched_yield returned to EL0 without the entry TLBI)
 - [x] Split page size model (GuestPageSize=4K, PageSize=16K, 74/77 Alpine tests)
 - [x] MAP_FIXED fix for FEX-Emu/glibc ld.so (no page4KRound on Fixed)
 - [x] FEX-Emu shared library loading (libstdc++, libc, libm, libgcc_s, ld.so)
-- [ ] FEX-Emu COW fault loop (L3 permission fault on non-16K-aligned IPA)
-- [ ] COW fork race at high concurrency (TLB coherency, needs Apple API)
+- [ ] FEX-Emu retest (the fault loop matched a since-fixed `HandleUserFault` bug)
+- [ ] Retest the high-concurrency Go stress test (its failures were attributed to TLB coherency, before asynchronous exits kept the guest state)
+- [x] Keep exact guest state on asynchronous exits (`hv_vcpus_exit`, vtimer, unknown exits)
+- [x] Per-vCPU FP/SIMD ownership (FP state no longer leaks between tasks sharing a vCPU)
+- [x] 4K guest-page granularity for every memory syscall, vma/pma boundary and mapping refcount
+- [x] Zero page not accessible and PROT_EXEC enforced (UXN/PXN) for applications
+- [x] Imported stdio shares the host file offset (redirected output no longer overwrites itself)
+- [x] Direct IPA mappings only (no shadow copies); gofer mounts use `force_page_cache`
+- [x] Nix external builder (`--nix-build`): host `nix build` builds `aarch64-linux` derivations in the sandbox
+- [x] Gofer: `utime`/`touch`/`tar` timestamps (macOS `utimensat` has no empty-path form), directory removal (Linux `AT_REMOVEDIR` passed to macOS), errnos above 34 translated to Linux values
+- [x] Gofer: `open(O_CREAT|O_WRONLY, 0444)` returned an FD that could not write, so `cp -p` of read-only sources (Nix `unpackPhase` of directory sources) failed with EBADF. The gofer reopens files by path, which macOS checks against the new mode; files are now created read-write, and a failed reopen returns its error instead of a read-only FD
+- [x] lisafs client: on macOS, `poll(POLLHUP)` misses a hangup that follows unread data (any RPC response), so `Client.Close` hung and gofer death went unnoticed. The watchdog now waits for `EV_EOF` with kqueue
+- [x] Command-line programs run by their guest path when a mount (`/nix/store`, the working directory, `--home`, `--mount`) shows them, as `execve` would. Before, they were always imported as a host FD named `host:[N]`, so interpreter scripts such as Nix wrappers (`./result/bin/nvim`) failed with `bash: host:[1]: No such file or directory`. A script outside every mount now fails with a message saying to `--mount` its directory
+- [x] Guest `CLOCK_REALTIME` via the VDSO: the sentry calibrated against host `CNTVCT_EL0`, not the `mach_absolute_time()` counter guests see, so realtime stalled between parameter updates (up to 1s behind)
 
 
 ## Performance
 
 ### sysbench (Apple M4 Pro)
 
-> **Note:** 10 fast-path syscalls handled at EL1 via ERET (~0.1µs, no VM
-> exit): getpid, getppid, getuid, geteuid, getgid, getegid, gettid,
-> sched_yield, getpgid(0), getsid(0). Other syscalls
-> exit via HVC #9 (~4µs round-trip). Lazy FP save skips 32 SIMD registers
-> on syscall exits (42% faster save). Dispatch code page infrastructure
-> ready for Go-assembled handlers (el1sentry POC proven). EL1 data access
-> + ESR_EL1 + STTR/LDTR all confirmed working.
+> **Note:** No syscall is handled inside the VM: every syscall exits via
+> HVC #9 (~4µs round-trip). FP/SIMD registers are saved on every exit and
+> reloaded only when the vCPU does not already hold the task's state.
+> Dispatch code page infrastructure ready for Go-assembled handlers
+> (el1sentry POC proven). EL1 data access + ESR_EL1 + STTR/LDTR all
+> confirmed working.
 
 | Benchmark | Native macOS | gVisor (lisafs) | gVisor (directfs) | Overhead |
 |-----------|-------------|----------------|-------------------|----------|
@@ -844,19 +1042,22 @@ native, limited by syscall overhead per I/O operation.
 | Metric | gVisor/macOS | Native macOS | Overhead |
 |--------|-------------|-------------|----------|
 | clock_gettime (VDSO) | 5 ns | 3 ns | ~1.7x |
-| getpid (fast-path) | **100 ns** | 32 ns | **~3x** |
 | getpid (VM exit) | 4,150 ns | 32 ns | ~130x |
 | Pipe throughput (4K) | 393 MB/s | 3,213 MB/s | ~8x |
 
 ### In-VM fast-path syscalls
 
-10 syscalls handled entirely at EL1 — no VM exit:
-getpid, getppid, getuid, geteuid, getgid, getegid, gettid (table
-dispatch at 0x400), sched_yield, getpgid(0), getsid(0)
-(extended handler at 0x600).
-**16M calls/second** for register-only syscalls.
+None. The ID syscalls (getpid, getppid, gettid, getuid, geteuid, getgid,
+getegid, getpgid(0), getsid(0)) used to be answered from constants
+patched into the vectors page. That page is shared by every vCPU and
+task, so every process saw the init process's IDs (getpid() == 1 after
+fork), which broke shell job control and temporary file names.
+sched_yield was answered at EL1 too, but its ERET skipped the entry
+stub's TLBI, and `Switch` now relies on every EL1 handler ending in an
+exit. Answering syscalls in-VM again would need per-vCPU values in the
+state page, written on every guest entry, and a TLBI on the return path.
 
-### Switch() hot path breakdown (non-fast-path syscalls)
+### Switch() hot path breakdown
 
 Use `--profile <file>` to collect per-Switch() timing stats.
 
@@ -864,20 +1065,16 @@ Use `--profile <file>` to collect per-Switch() timing stats.
 |-----------|------|-----------|-------|
 | loadRegisters | ~800 ns | 12% | Batched CGO (31 regs in 1 call) |
 | hv_vcpu_run | ~4,700 ns | 73% | Apple HVF VM exit floor |
-| saveRegisters | ~800 ns | 13% | Batched CGO, lazy FP (skip on SVC) |
-| **Total** | **~6,400 ns** | 100% | Non-fast-path syscalls |
-
-Fast-path syscalls bypass the entire Switch() loop (~0.1µs via ERET).
-Lazy FP save: skip 32 SIMD register reads on syscall exits (save FP
-only on fault exits that may trigger signal delivery).
+| saveRegisters | ~800 ns | 13% | Batched CGO |
+| **Total** | **~6,400 ns** | 100% | Per syscall |
 
 ### Optimization approaches tested
 
 | Approach | Result | Status |
 |----------|--------|--------|
-| In-VM ERET fast-path | 10 syscalls at ~0.1µs | **Deployed** |
+| In-VM ERET fast-path | ID syscalls at ~0.1µs, but wrong after fork (shared vectors page) | Removed |
 | Batched CGO register save/load | ~500ns per batch vs ~4.5µs individual | **Deployed** |
-| Lazy FP save (skip on SVC) | 42% faster save path | **Deployed** |
+| Lazy FP save (skip on SVC) | 42% faster save path | Replaced: FP saved on every exit, loaded only when needed |
 | Go asm dispatch page (el1sentry) | C/Go compiled code at EL1 via BLR | **Proven (POC)** |
 | hv_vcpu_run_until(FOREVER) | Eliminates vtimer exits | **Deployed** |
 | Selective TLBI (ASIDE1IS) | ~50ns per flush, no measurable speedup | **Deployed** |
@@ -979,8 +1176,8 @@ without a full x86 VM.
 
 **Status:** FEX loads all shared libraries and starts the interpreter.
 The original string table corruption crash (`0x4700312e6f7331d9`) is
-fixed. A remaining L3 permission fault loop blocks full execution --
-see [docs/FEX-EMU.md](docs/FEX-EMU.md) for root cause analysis.
+fixed. A fault loop then blocked execution (see below); it has not been
+retested since the fix for its likely cause.
 
 **What works:**
 
@@ -1015,18 +1212,17 @@ docker rm -f x86build
 ./sentrydarwin --rootfs _tmp/ubuntu-rootfs /usr/bin/FEXInterpreter /usr/local/bin/hello_x86
 ```
 
-### Remaining Issue
+### Fault Loop (likely fixed, not retested)
 
-COW break for non-16K-aligned file-backed private pages triggers an L3
-permission fault loop. When the guest writes to a COW page whose
-backing IPA is not 16K-aligned, the AP bit update (read-only to
-read-write) does not take effect in the HVF stage-2 TLB. The guest
-re-faults on the same address indefinitely. This is an Apple Silicon
-HVF limitation with 4K granule page table permission upgrades.
-
-**Workaround under investigation:** IPA remapping (allocate new IPA,
-copy data, remap) instead of in-place AP bit changes for COW breaks
-on non-aligned pages.
+Writes to copy-on-write pages re-faulted on the same address
+indefinitely. This was attributed to HVF not applying in-place AP
+(permission) upgrades for IPAs that are not 16K-aligned. It matches a
+sentry bug fixed since: `HandleUserFault` rounded the faulting address down
+to 16K and obtained pmas only within the vma containing that rounded
+address. When the 16K page started in the previous vma (e.g. the segment
+before a writable data segment), the faulting page was never mapped
+writable and never had its copy-on-write broken, so the same fault
+recurred. The fault range is now clamped to the faulting vma.
 
 See [docs/FEX-EMU.md](docs/FEX-EMU.md) for the full investigation,
 including the original crash root cause and the `page4KRound` fix.
@@ -1088,9 +1284,9 @@ minimum mapping granularity is 16K.
 
 **Fixed:** Three issues resolved:
 
-1. **MRS instruction hang** — HVF traps `MRS ID_AA64MMFR0_EL1` at EL0
-   and never returns. Fixed by scanning shadow-copied code pages for
-   MRS instructions and patching them to MOV with the correct values.
+1. **MRS instruction hang** — HVF traps `MRS ID_AA64MMFR0_EL1` at EL0.
+   This was first worked around by patching MRS instructions in copied code
+   pages; the reads are now trapped and emulated (`emulateSysreg`).
 
 2. **64GB VA limit** — Go runtime arena hints require addresses above
    64GB. Fixed by expanding guest page tables from 2-level (36-bit VA)
@@ -1121,61 +1317,55 @@ the saved syscall SP. Needs sentry-level fix for vfork task scheduling.
 ## Limitations
 
 - **Host networking (utun)**: requires root (drops privileges after setup). Use `--net=vmnet` with socket_vmnet for rootless networking.
-- **Shadow page memory**: File-backed guest pages (shared libraries, executables) use 2x memory due to anonymous shadow copies. Negligible for most workloads.
-- **VDSO sub-millisecond timing**: `CNTVCT_EL0` reads inside the guest may return the same value within a single HVF execution slice. Programs that measure sub-millisecond intervals via the VDSO (e.g., `ping` RTT) show `time=0.000 ms` after the first packet. Wall clock and second-resolution timing work correctly.
+- **Imported host files**: Redirected stdio, and a command-line program outside every mount, are host FDs mapped `MAP_PRIVATE`; stores through a shared writable mapping of them never reach the file. Gofer-mounted files (`--mount`, `--rootfs`, `/nix/store`) use the sentry page cache and are written back (on `msync`, `fsync`, `munmap` and exit); while a gofer file is mapped, changes made on the host are not seen by the guest.
 - **Java / JVM**: Blocked by upstream HotSpot AArch64 assembler bug (`logical_immediate_encode` fails for 16K-derived values). Tested JDK 17, 21, 26 — all crash identically during stub generation. See [docs/MRS-TRAPPING.md](docs/MRS-TRAPPING.md).
-- **Page size**: Guest uses a split model -- `GuestPageSize=4K` for VMA alignment (syscall-facing), `PageSize=16K` for PMA/MemoryFile (host-facing). HandleUserFault tries 16K ranges first and falls back to 4K at VMA boundaries. PMA allocations clamp to VMA bounds. Sub-16K PROT_NONE guard pages are handled by skipping VMA creation. Use `--page16k` for macOS-native 16K pages. See [Split Page Size Model](#page-size-split-model-4k-guest--16k-host).
-- **FEX-Emu COW faults**: Non-16K-aligned file-backed private pages trigger an L3 permission fault loop during COW break. Apple Silicon HVF does not flush stale stage-2 TLB entries when AP bits change on sub-16K-aligned IPAs. Workaround: IPA remapping instead of in-place AP changes. See [docs/FEX-EMU.md](docs/FEX-EMU.md).
+- **Page size**: Guest pages are 4K and every memory syscall is exact at 4K; the host page (16K) only matters for MemoryFile and host mappings and for fault-around. Use `--page16k` for macOS-native 16K pages (currently broken). See [Split Page Size Model](#page-size-split-model-4k-guest--16k-host).
 - **Stale vmnet packets**: When using `--net=vmnet`, ICMP replies from previous sessions may appear briefly. Clears after vmnet bridge ARP entries expire (~30s).
 
-## TLB Coherency (HVF ARM64 Limitation)
+## TLB Coherency (HVF ARM64)
 
-### Problem
+### Mechanisms
 
-When multiple vCPUs run concurrently and the sentry modifies page tables (via `MapFile`/`Unmap`), other vCPUs inside `hv_vcpu_run` may retain stale TLB entries pointing to old page mappings. If the backing page is freed, zeroed, and recycled before the stale TLB entry expires, the vCPU reads corrupted data (typically zeroed or recycled stack frames), causing guest crashes.
+HVF on ARM64 has no API to invalidate a vCPU's TLB (x86 HVF has
+`hv_vcpu_invalidate_tlb()`), and `hv_vcpus_exit()` is asynchronous. The
+platform relies on the guest's own TLBI on every entry, and on waiting for
+vCPUs to leave the guest before releasing pages:
 
-The failure manifests as Go runtime panics: `SIGSEGV at unknown pc` (corrupted return address from stale stack data) or `split stack overflow` (stack metadata corruption).
-
-### Root Cause
-
-**HVF ARM64 does not implement ASID-tagged TLB.** This was confirmed by testing with `nG=0` (Global pages, no ASID tagging) vs `nG=1` (non-Global, ASID-tagged) — identical failure rates (~90%). The ARM64 `nG` bit and ASID field in `TTBR0_EL1` have no effect on HVF's TLB behavior.
-
-Additionally, **HVF ARM64 provides no guest TLB invalidation API**. The x86 HVF has `hv_vcpu_invalidate_tlb()`, but the ARM64 API (`hv_vcpu.h`) has no equivalent. The only exit mechanism is `hv_vcpus_exit()`, which is asynchronous — the vCPU may execute 1-2 more instructions with stale TLB before actually exiting.
-
-### Mitigations Applied
-
-The initial mitigations (quarantine, zero-page remap, generation tracking, kickAllVCPUs) were replaced by direct TLBI at EL1. Current mitigations:
-
-| Mitigation | Effect | Code |
+| Mechanism | Effect | Code |
 |-----------|--------|------|
-| Direct TLBI VMALLE1IS | Flush all stage-1 TLB on every guest entry | vectors offset 0x810 stub |
-| Break-before-make | Clear old PTE before writing new one | `mapPage()` |
-| DSB ISH barrier | Full inner-shareable barrier (not just store) | `ptBarrier()` |
-| ASID rotation | Per-vCPU incrementing 16-bit ASID | `Switch()` in `context.go` |
+| Entry TLBI | Every entry uses a fresh per-vCPU 16-bit ASID and the entry stub flushes it (TLBI ASIDE1IS; TLBI VMALLE1IS on ASID wrap) | stub at 0x810, `Switch()` |
+| Break-before-make | Clear old PTE, DSB ISH, write new PTE | `mapPage()` |
+| Flush before release | `Unmap` and PTE-replacing `MapFile` kick vCPUs running that address space (`hv_vcpus_exit`) and wait until each has left `hv_vcpu_run` before releasing the old IPAs. A kicked vCPU keeps its exact state and re-enters through the entry stub | `flushTLB()` in `machine.go` |
+| Exact IPA refcounts | Each valid PTE owns one IPA reference | `mapPage()` in `pagetable.go` |
 
-Combined result: **100%** on all real-world workloads. ~1-2% failure rate remains on pathological stress tests (14 concurrent goroutines × deep recursion).
+### History
+
+This section used to attribute Go runtime crashes under many concurrent
+goroutines (`SIGSEGV at unknown pc`, `split stack overflow`, ~1-2% of stress
+runs) to HVF ignoring ASIDs, since `nG=0` and `nG=1` failed equally often.
+Those measurements were taken while `Switch` discarded the guest's registers
+whenever `hv_vcpus_exit` interrupted it: every signal delivery (including Go's
+SIGURG preemption) and every kick replayed user code from the last guest
+entry after its memory effects had happened. That alone produces these
+symptoms, and it explains why approaches that kicked vCPUs more often did
+worse (kickAllVCPUs + epoch wait: 93-94% success; Unmap before MapFile: 62%).
+A guest loop that counts in a register while incrementing a memory counter
+overshot by about 30x under 500 signals before the fix, and is exact under
+about 20,000 signals after it. The ASID conclusion is therefore unverified,
+and the stress test has not been rerun.
 
 ### Approaches Investigated and Rejected
 
-| Approach | Result | Why |
-|----------|--------|-----|
-| `hv_vcpu_invalidate_tlb` | N/A | ARM64 HVF doesn't have this API |
-| TLBI via guest stub (HVC exit) | Broken | Mini `hv_vcpu_run` for TLBI corrupts `ESR_EL1` state even with full save/restore |
-| TLBI via guest stub (ERET exit) | Broken | ERET continues guest execution instead of returning to sentry |
-| mprotect host TLB shootdown | Broken | mprotect on MAP_SHARED MemoryFile corrupts other mappings |
-| Zero-page IPA remap | 83% (worse) | Silent zero reads cause harder-to-detect corruption |
-| Unmap-before-MapFile | 62% (much worse) | Lock contention from kicking vCPUs during page fault handling |
-| TTBR0 toggle (null + real) | Deadlock | Null TTBR causes infinite page fault retry |
-| Global pages (nG=0) | 90% (same) | Confirms HVF ignores ASID entirely |
-| kickAllVCPUs + epoch wait | 93-94% | Async hv_vcpus_exit can't guarantee immediate exit |
-| kickAllVCPUs + RCU quarantine | 93% (worse) | Kick causes vCPU churn that widens race window |
+These results were measured while interrupts still discarded guest state
+(see above), so they do not isolate TLB effects.
 
-### Impact
-
-- **Pathological stress test** (14 concurrent goroutines × deep recursion forcing rapid stack growth): ~1-2% failure rate
-- **Real-world workloads** (shell, apk, Go binaries, fork+exec, HTTP server): 0% failure rate (30/30, 20/20 in repeated tests)
-- **Package installation** (`apk add tree less nano`): works reliably
-- **Concurrent TCP** (20 connections, loopback): works reliably
+| Approach | Result |
+|----------|--------|
+| `hv_vcpu_invalidate_tlb` | ARM64 HVF doesn't have this API |
+| TLBI via guest stub (HVC exit) | Mini `hv_vcpu_run` for TLBI corrupted `ESR_EL1` state |
+| TLBI via guest stub (ERET exit) | ERET continues guest execution instead of returning to sentry |
+| mprotect host TLB shootdown | mprotect on MAP_SHARED MemoryFile corrupted other mappings |
+| TTBR0 toggle (null + real) | Deadlock: null TTBR causes infinite page fault retry |
 
 ### TLBI Guest Stub Investigation
 
@@ -1192,17 +1382,7 @@ Attempted to flush guest TLB by running a small TLBI stub (TLBI VMALLE1IS + DSB 
 
 **Conclusion:** No viable mechanism exists to execute guest-mode TLBI and cleanly return to the host on HVF ARM64. The hypervisor provides no clean "run N instructions and stop" primitive.
 
-### Resolution Path
-
-1. **Sentry-as-Ring0** (see [architecture section](#sentry-as-ring0-with-host-vmm-kvm-style-architecture)): run sentry at EL1 inside the VM, execute TLBI directly — eliminates the problem entirely
-2. **Apple API additions**: `hv_vcpu_invalidate_tlb()` for ARM64, or ASID-tagged TLB in HVF's guest MMU, or synchronous `hv_vcpus_exit()`
-
-## Sequential Exec Crash (Root Cause) — FIXED
-
-> **Status: Fixed** via shadow pages in `ipaAllocator.mapPageShadow`.
-> File-backed guest pages are copied into anonymous memory before being
-> passed to `hv_vm_map`. Anonymous pages have stable physical addresses
-> that macOS will not relocate. Tested: 1000× `jq` iterations, zero crashes.
+## Sequential Exec Crash — FIXED
 
 ### Symptom (before fix)
 
@@ -1219,160 +1399,42 @@ per-exec memory footprint:
 | `tree` (musl only) | 100+ | ~0.2MB |
 | `grep` (musl + pcre2) | 100+ | ~0.3MB |
 
-Cumulative MemoryFile consumption at crash: ~65MB.
+The guest read the right file at the wrong offset: at the crashing PC it
+saw `0xb9400001` (LDR W1,[X0,#0]), which is at musl file offset `0x6cc90`,
+not the mapped offset `0xc90` (27 × 16K pages apart), although `MapFile`
+had been given the correct file range.
 
-### Root Cause
+### Cause
 
-**macOS silently changes the physical page backing mmap'd host VAs
-without notifying HVF's stage-2 page tables.**
+This was attributed to macOS relocating the physical pages behind
+`hv_vm_map` and worked around by copying file-backed pages into anonymous
+"shadow" pages. Direct tests contradict that theory: stage-2 translation
+follows the host mapping, and host and guest stay coherent across host
+paging, compression and hole punching, for `MAP_SHARED` and `MAP_PRIVATE`
+mappings alike. What does leave the guest on old pages is replacing the host
+mapping behind a live IPA (`munmap`, or `mmap` with `MAP_FIXED`).
 
-The guest page at VA `base+0` (file offset 0) contains musl text from
-file offset `0x6C000` (27 pages shifted). The page content is from the
-CORRECT file (musl) but the WRONG offset. This was confirmed by reading
-the crash instruction from guest memory:
+IPAs were keyed by host VA, and several bugs let an IPA outlive the host
+mapping it was created for (consistent with the symptom; not reproduced):
+- `fsutil.MmapCachedFile` counted its chunk references in 16K pages, so
+  4K-granular mappings added no references and a host chunk could be
+  unmapped while guest PTEs still used it. A later chunk mapped at the
+  recycled host VA then got the old IPA and its old pages.
+- Re-mapping a present page leaked an IPA reference, keeping such IPAs alive.
+- The shadow workaround shared one IPA per host VA between direct and shadow
+  users, and refreshed a shadow page other processes were using whenever the
+  host VA was mapped again.
 
-```
-At PC base+0xc90:  guest reads 0xb9400001 (LDR W1,[X0,#0])
-File offset 0xc90: contains 0x000000d6 (.hash table data)
-File offset 0x6cc90: contains 0xb9400001 (musl .text code)
-Shift: 0x6cc90 - 0xc90 = 0x6C000 = 27 × 16K pages
-```
+### Fix
 
-The ELF loader's `mapSegment` correctly passes file offset 0 to `MapFile`.
-Our `ipaAllocator.mapPage` correctly maps the host VA for file offset 0.
-But HVF's stage-2 IPA→PA translation points to the physical page that
-backs file offset `0x6C000` instead of `0`. macOS changed the physical
-page assignment without updating HVF.
-
-This affects BOTH `MAP_PRIVATE` (mmapFile direct path) and `MAP_SHARED`
-(MemoryFile page cache path). Neither `hv_vm_unmap+remap`, `mlock`, nor
-page touches before mapping prevent it. This is a macOS/HVF kernel-level
-coherency bug. Fixed by shadow-copying file-backed pages into anonymous
-memory before passing to `hv_vm_map`. See [Shadow Pages Fix](#shadow-pages-fix) below.
-
-### Investigation Summary
-
-Extensive experiments ruled out all other causes:
-
-| Hypothesis | Test | Result |
-|-----------|------|--------|
-| PT page reuse / stage-2 TLB | Disabled reuse | Same crash |
-| Data IPA reuse | Forced immediate reuse | Same crash |
-| hv_vm_unmap accumulation | Disabled unmap | Same crash |
-| pgalloc.Allocate failure | Logged all calls | Never fails |
-| mmap failure | Logged all calls | Never fails |
-| LoadTaskImage failure | Logged | Never fails |
-| Chunk boundary crossing | 4GB chunks | Same crash |
-| MemoryFile page recycling | Disabled recycling entirely | Same crash (18) |
-| msync after zeroing | Added MS_SYNC | Same crash |
-| Stage-2 flush on IPA reuse | Added unmap+remap | Same crash |
-| Pre-allocated 512MB file | ftruncate at start | Same crash |
-| ASLR | Disabled (mmapRand=0) | Same crash |
-| Go GC | GOGC=off | Same crash |
-| Memory pressure | Purged to 7GB free | Same crash |
-| Go data race | Built with -race | No races found |
-| Multi-vCPU | --cpus 1 | Same crash |
-| FD limits | defaults to infinity | N/A |
-
-Key experiments that narrowed it down:
-
-- **Crash instruction dump**: `0xb9400001` (LDR W1,[X0,#0]) at PC, exists at musl file offset 0x6cc90 — page shifted by 0x6C000
-- **MapFile logging**: file offsets are CORRECT at map time (fr=[0x0,0x4000))
-- **Both MAP_PRIVATE and MAP_SHARED crash**: forcePageCache (MemoryFile) has identical crash at same offset
-- **mlock makes it WORSE** (0/200): interferes with page management
-- **hv_vm_unmap+remap doesn't help**: macOS returns same stale physical page
-- **Anonymous page copy breaks writes**: read/write desynchronized
-
-### Mechanism
-
-1. `hv_vm_map(hostVA, IPA)` creates a stage-2 entry mapping IPA to the
-   physical page currently backing hostVA
-2. macOS page management (compressor, deduplication, or swap) silently
-   changes the physical page backing hostVA — assigning a physical page
-   that belongs to a DIFFERENT virtual page (shifted by 27 pages)
-3. HVF's stage-2 entry is NOT updated — it still points to the old
-   physical page (which now belongs to a different file offset)
-4. Guest reads through IPA → stale stage-2 → wrong physical page →
-   content from file offset 0x6C000 instead of 0
-
-This is a macOS/HVF kernel coherency bug. The macOS VM subsystem does
-not notify Hypervisor.framework when it changes the physical backing
-of pages that were passed to `hv_vm_map`.
-
-### Shadow Pages Fix
-
-The fix is a shadow page approach in `ipaAllocator`: every file-backed
-guest page is copied into anonymous memory (`posix_memalign` + `memcpy`)
-before being passed to `hv_vm_map`. Anonymous pages have stable physical
-addresses that macOS will not relocate.
-
-A `sentryOwnedFile` marker interface (implemented by `pgalloc.MemoryFile`)
-distinguishes sentry-managed pages (mapped directly, since the sentry
-writes to them and those writes must be visible to the guest) from
-file-backed pages (shadow-copied to prevent PA relocation).
-
-**Result:** 1000× `echo {} | jq .n` → zero crashes (was ~315 before fix).
-
-**Cost:** ~2× memory for file-backed guest pages, one `memcpy` per new page.
-
-| File | Change |
-|------|--------|
-| `pkg/sentry/platform/hvf/ipa_allocator.go` | `mapPageShadow()`: allocate anon page, memcpy, map to HVF |
-| `pkg/sentry/platform/hvf/address_space.go` | `MapFile`: use `mapPageShadow` for non-MemoryFile pages |
-| `pkg/sentry/pgalloc/pgalloc_darwin.go` | `IsSentryOwned()` marker on MemoryFile |
-
-### Prior Approaches (before shadow pages)
-
-Many approaches were tested before the shadow page fix was found:
-
-| Approach | Result |
-|----------|--------|
-| hv_vm_unmap + hv_vm_map (re-resolve PA) | Same crash |
-| mlock (pin physical pages) | Worse (0/200) |
-| Touch page before hv_vm_map | Same crash |
-| MAP_SHARED for mmapFile | HVF rejects (quarantine) |
-| forcePageCache (copy to MemoryFile) | Same crash |
-| Anonymous copy in mapPage (all pages) | Breaks sentry writes |
-| Mach anonymous MemoryFile only | Crash at 0 (wrong layer) |
-| Retain mmapFile chunk mappings | Same crash |
-| MAP_FIXED re-mmap on every access | Same crash |
-
-The key insight was that earlier anonymous copy attempts failed because
-they copied ALL pages (including MemoryFile pages that the sentry writes
-to). The shadow page fix only copies file-backed pages, leaving
-MemoryFile pages directly mapped.
-
-### Systematic Investigation
-
-Many approaches were tested systematically. Most failed because they
-either shadow-copied ALL pages (breaking sentry writes) or only fixed
-one layer (MemoryFile but not gofer files). The eventual fix (see
-[Shadow Pages Fix](#shadow-pages-fix)) succeeded by shadow-copying only
-file-backed pages while leaving MemoryFile pages directly mapped.
-Earlier failed attempts:
-
-| Approach | Result | Why it failed |
-|----------|--------|---------------|
-| Anonymous copy in `ipaAllocator.mapPage` | Crash | Broke guest↔host write sync |
-| Anonymous copy in `MmapCachedFile.MapInternal` | 8 | Crash on MemoryFile pages too |
-| mlock on anonymous + MemoryFile pages | 0 | mlock makes it worse |
-| `hv_vm_protect` re-resolve on IPA reuse | 7 | protect doesn't re-resolve PA |
-| `hv_vm_unmap` + `hv_vm_map` on every reuse | 7 | Re-mapping gets same stale PA |
-| No IPA reuse, no host VA cache | 8 | Rules out IPA/TLB staleness |
-| Touch pages before `hv_vm_map` | 8 | Page fault doesn't fix PA |
-| Pre-map MemoryFile chunks at startup (QEMU-style) | 8 | macOS changes PAs even for active mappings |
-| Combined: pre-map chunks + anon copy MmapCachedFile | 8 | Both paths affected |
-| Disable `fallocateDecommit` (no-op punchhole) | 0 | Broke page management |
-| `--ring0` TCR swap entry stub | 0/13 | Breaks fork; no improvement without pipe |
-
-**Key finding:** QEMU avoids this bug because it maps guest RAM once at
-VM startup as a single large anonymous mmap and never unmaps individual
-pages. gVisor's demand-paging model (per-page `hv_vm_map`/`hv_vm_unmap`)
-triggers macOS memory management patterns that cause PA relocation.
-Even QEMU-style pre-mapping of MemoryFile chunks did not help, suggesting
-macOS relocates PAs even for continuously-mapped regions under memory pressure.
-The final fix used the QEMU insight (anonymous memory is stable) but applied
-it selectively to file-backed pages only.
+- Exact IPA refcounts: each valid PTE owns one reference.
+- Host-file chunk references are counted in guest pages, and chunks are
+  mapped writable from the start, so they are never remapped while mapped
+  by the guest.
+- Gofer mounts use `force_page_cache`: application mappings of gofer files
+  are MemoryFile pages, whose host mappings never change.
+- Shadow pages and MRS patching are gone; every guest page maps its host
+  page directly.
 
 ## Future Ideas
 
@@ -1396,8 +1458,8 @@ handling** was tested and **rejected** — it's 5x slower than HVF.
 
 This would be similar to how gVisor's `ptrace` platform works on Linux
 (`PTRACE_SYSEMU`), but using macOS Mach primitives instead. However,
-the 14µs latency makes it worse than HVF for all syscalls. HVF with
-ERET fast-path (0.1µs for 7 syscalls, 4µs for others) is optimal.
+the 14µs latency makes it worse than HVF for all syscalls (about 4µs per
+HVF exit).
 
 gVisor on
 macOS competitive with native Linux performance.
@@ -1498,7 +1560,7 @@ ring 0 (kernel mode), handling most syscalls without exiting the VM.
 | Component | File(s) | Status |
 |-----------|---------|--------|
 | EL0 guest execution | `vcpu_arm64.go`, `pagetable.go` | Production — SPSR=EL0t, SP_EL0, AP[1] |
-| Direct TLBI at EL1 | `vcpu_arm64.go` (0x810 stub) | Production — VMALLE1IS on every entry |
+| Direct TLBI at EL1 | `vcpu_arm64.go` (0x810 stub) | Production — TLBI ASIDE1IS on every entry |
 | TLB quarantine removal | `ipa_allocator.go` | Production — direct TLBI replaces quarantine |
 | 40-bit IPA | `hvf.go` | Production — `hv_vm_config_set_ipa_size(40)` |
 | Dual-TTBR page tables | `kernel_pagetable.go` | Done — TCR_EL1 EPD1=0 |
@@ -1540,7 +1602,8 @@ SVC syndrome), ELR_EL1, and FAR_EL1 after EL0→EL1 exceptions.
 
 **ERET fast-path achieved** for 10 syscalls (~0.1µs, 40x faster):
 7 table-dispatch (getpid, gettid, getuid, getgid, geteuid, getegid,
-clock_gettime) + 3 extended (sched_yield, getpgid, getsid).
+clock_gettime) + 3 extended (sched_yield, getpgid, getsid). All have since
+been removed (see [In-VM fast-path syscalls](#in-vm-fast-path-syscalls)).
 EL1 data access through TTBR1 kernel page tables
 enables reading per-vCPU state pages and dispatch code.
 
@@ -1624,5 +1687,5 @@ Tested with `--net` flag (utun + userspace TCP/UDP/ICMP proxy):
 | Public IP detection (ifconfig.me) | Pass |
 | APK index update (dl-cdn.alpinelinux.org) | Pass |
 | 3 concurrent HTTPS downloads | Pass |
-| APK package install (many files) | Pass (shadow pages fix) |
+| APK package install (many files) | Pass |
 | ICMP ping | Pass (unprivileged SOCK_DGRAM) |

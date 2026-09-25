@@ -1,4 +1,4 @@
-// Copyright 2024 The gVisor Authors.
+// Copyright 2018 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,16 +15,14 @@
 //go:build linux
 // +build linux
 
-package fsutil
+package contexttest
 
-import "golang.org/x/sys/unix"
+import (
+	"gvisor.dev/gvisor/pkg/sentry/platform"
+	"gvisor.dev/gvisor/pkg/sentry/platform/ptrace"
+)
 
-// mapFixedNoreplace is MAP_FIXED_NOREPLACE on Linux.
-const mapFixedNoreplace = unix.MAP_FIXED_NOREPLACE
-
-// mmapSharedFlag is MAP_SHARED on Linux for standard file mapping.
-const mmapSharedFlag = unix.MAP_SHARED
-
-// mapChunksWritable is false on Linux: MmapCachedFile maps chunks writable
-// only when required, since the mappings are shared with the file.
-const mapChunksWritable = false
+// newPlatform returns the platform.Platform used by test contexts: ptrace.
+func newPlatform() (platform.Platform, error) {
+	return ptrace.New()
+}

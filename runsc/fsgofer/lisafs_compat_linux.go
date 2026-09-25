@@ -66,6 +66,10 @@ func initProcSelfFD() error {
 	return nil
 }
 
+// createAccessMode is the access mode OpenCreate creates files with. The
+// gofer reopens the new file via /proc/self/fd with the client's flags.
+const createAccessMode = unix.O_RDONLY
+
 // reopenFD reopens a file descriptor with new flags via /proc/self/fd.
 func reopenFD(hostFD int, flags int) (int, error) {
 	return unix.Openat(int(procSelfFD.FD()), strconv.Itoa(hostFD), flags, 0)
@@ -110,6 +114,12 @@ func accept4FD(fd int, flags int) (int, error) {
 // tryOpenFallbackFlags returns platform-specific fallback open flags.
 func tryOpenFallbackFlags() []int {
 	return []int{unix.O_PATH}
+}
+
+// openSymlinkAt opens the symlink name in dirFD itself, without following
+// it.
+func openSymlinkAt(dirFD int, name string) (int, error) {
+	return unix.Openat(dirFD, name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 }
 
 // fstatToStatx converts an Fstat result to lisafs.Statx.

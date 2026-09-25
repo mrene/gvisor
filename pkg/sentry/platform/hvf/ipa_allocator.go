@@ -18,6 +18,7 @@ package hvf
 
 /*
 #include <Hypervisor/Hypervisor.h>
+#include <libkern/OSCacheControl.h>
 #include <stdlib.h>
 #include <string.h>
 */
@@ -27,29 +28,34 @@ import (
 	"fmt"
 	"unsafe"
 
-	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // ipaAllocator manages the guest IPA (Intermediate Physical Address)
-// space for the HVF VM. It assigns unique IPAs to host memory pages,
+// space for the HVF VM below memFileIPABase. It assigns unique IPAs to host
+// memory pages that are not in the sentry's MemoryFile (see memFileMapper),
 // enabling per-process page tables where different VAs can map to
 // different physical pages.
 //
-// Shadow pages: macOS can silently relocate the physical page backing
-// a file-mapped host VA (e.g., MAP_PRIVATE of a gofer file) without
-// updating HVF's stage-2 tables. This causes the guest to read stale
-// data, crashing dynamically-linked binaries. To prevent this, guest
-// user pages are "shadow-copied": the file-backed content is copied
-// into anonymous memory (MAP_PRIVATE|MAP_ANONYMOUS), and the anonymous
-// VA is passed to hv_vm_map. Anonymous pages have stable physical
-// addresses that macOS will not relocate.
+// hv_vm_map maps each host page itself, so the guest and the sentry access
+// the same memory. HVF's stage-2 translation follows the host mapping (the
+// VM object behind the host VA), not the physical pages it had when mapped:
+// host and guest stay coherent across host paging, compression and hole
+// punching, for MemoryFile (MAP_SHARED) and host file (MAP_PRIVATE, see
+// fsutil.MmapCachedFile) mappings alike. However, replacing the host mapping
+// behind a live IPA (munmap, or mmap with MAP_FIXED) leaves the guest with
+// the old pages. IPAs are identified by host VA, so each IPA must be
+// released before the host mapping of its page is replaced: callers hold
+// references on the mapped memmap.File range for at least as long as their
+// references on the IPA.
 type ipaAllocator struct {
 	mu      sync.Mutex
 	nextIPA uint64
 	// hostToIPA maps host page address → assigned IPA.
 	hostToIPA map[uintptr]uint64
-	// refCount tracks how many address spaces reference each IPA.
+	// refCount tracks how many references exist to each IPA.
 	refCount map[uint64]int
 	// freeIPAs holds IPAs that were unmapped and can be reused,
 	// keyed by page size. Prevents nextIPA from growing without bound.
@@ -58,8 +64,9 @@ type ipaAllocator struct {
 	ipaToHost map[uint64]uintptr
 	// ipaSize tracks the mapped size of each IPA for correct unmapping.
 	ipaSize map[uint64]uintptr
-	// shadowPages maps IPA → anonymous shadow page pointer.
-	shadowPages map[uint64]unsafe.Pointer
+	// icacheSynced holds IPAs whose page the instruction cache has been
+	// made coherent with by prepareExec.
+	icacheSynced map[uint64]struct{}
 }
 
 // ipaBase is the start of the allocatable IPA range. The first 16MB
@@ -69,119 +76,63 @@ type ipaAllocator struct {
 // hundreds of concurrent processes.
 const ipaBase = 0x1000000 // 16MB
 
+// memFileIPABase is the end of the ipaAllocator range and the IPA of offset 0
+// of the sentry's MemoryFile (see memFileMapper).
+const memFileIPABase = 1 << 39 // 512GB
+
 // ipaMax is the maximum IPA (40-bit, matching hv_vm_config IPA size).
 const ipaMax = 1 << 40 // 1TB
 
 func newIPAAllocator() *ipaAllocator {
 	return &ipaAllocator{
-		nextIPA:     ipaBase,
-		hostToIPA:   make(map[uintptr]uint64),
-		ipaToHost:   make(map[uint64]uintptr),
-		ipaSize:     make(map[uint64]uintptr),
-		refCount:    make(map[uint64]int),
-		freeIPAs:    make(map[uintptr][]uint64),
-		shadowPages: make(map[uint64]unsafe.Pointer),
+		nextIPA:      ipaBase,
+		hostToIPA:    make(map[uintptr]uint64),
+		ipaToHost:    make(map[uint64]uintptr),
+		ipaSize:      make(map[uint64]uintptr),
+		refCount:     make(map[uint64]int),
+		freeIPAs:     make(map[uintptr][]uint64),
+		icacheSynced: make(map[uint64]struct{}),
 	}
 }
 
 // mapPage ensures a host page is mapped in the HVF IPA space and
 // returns its IPA. If already mapped, returns the existing IPA and
 // increments the reference count.
-//
-// This method maps the host VA directly into HVF. It is used for
-// kernel (sentry) memory that is already anonymous and must remain
-// writable by the sentry (Go heap, goroutine stacks, etc.).
 func (a *ipaAllocator) mapPage(hostAddr uintptr, size uintptr) (uint64, error) {
-	return a.mapPageInternal(hostAddr, size, false)
-}
-
-// mapPageShadow maps a host page into HVF via an anonymous shadow
-// copy. The content at hostAddr is copied into freshly allocated
-// anonymous memory, and the anonymous VA is passed to hv_vm_map.
-// This prevents macOS from relocating the physical page backing
-// file-mapped host VAs (MAP_PRIVATE of gofer files), which would
-// cause HVF's stage-2 tables to point at the wrong physical page.
-//
-// Used for guest user pages from MapFile.
-func (a *ipaAllocator) mapPageShadow(hostAddr uintptr, size uintptr) (uint64, error) {
-	return a.mapPageInternal(hostAddr, size, true)
-}
-
-func (a *ipaAllocator) mapPageInternal(hostAddr uintptr, size uintptr, shadow bool) (uint64, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	// Check if already mapped.
 	if ipa, ok := a.hostToIPA[hostAddr]; ok {
-		if shadow {
-			if sp, hasShadow := a.shadowPages[ipa]; hasShadow {
-				// Refresh existing shadow copy.
-				C.memcpy(sp, unsafe.Pointer(hostAddr), C.size_t(size))
-			} else {
-				// Was mapped direct, now requested as shadow. Create
-				// shadow copy and remap to prevent PA relocation.
-				var anonMem unsafe.Pointer
-				if ret := C.posix_memalign(&anonMem, C.size_t(size), C.size_t(size)); ret != 0 || anonMem == nil {
-					return 0, fmt.Errorf("posix_memalign failed for shadow upgrade (size=%d)", size)
-				}
-				C.memcpy(anonMem, unsafe.Pointer(hostAddr), C.size_t(size))
-				patchIDRegisterReads(anonMem, size)
-				C.hv_vm_unmap(C.hv_ipa_t(ipa), C.size_t(size))
-				ret := C.hv_vm_map(anonMem, C.hv_ipa_t(ipa), C.size_t(size),
-					C.HV_MEMORY_READ|C.HV_MEMORY_WRITE|C.HV_MEMORY_EXEC)
-				if ret != C.HV_SUCCESS {
-					C.free(anonMem)
-					return 0, fmt.Errorf("hv_vm_map shadow upgrade failed: %d", ret)
-				}
-				a.shadowPages[ipa] = anonMem
-			}
-		}
 		a.refCount[ipa]++
 		return ipa, nil
 	}
 
-	// Prefer fresh IPAs until we hit 512GB, then reuse freed ones.
+	// Prefer fresh IPAs until we hit 256GB, then reuse freed ones.
 	// Early reuse causes stage-2 TLB staleness. Deferring reuse
 	// until we've consumed significant IPA space gives HVF time
 	// to flush stage-2 TLB entries for unmapped IPAs.
 	var ipa uint64
-	// ipaReuseThreshold: prefer fresh IPAs until 512GB to avoid
-	// stage-2 TLB staleness from immediate IPA reuse.
-	const ipaReuseThreshold = 1 << 39 // 512GB
+	const ipaReuseThreshold = memFileIPABase / 2
 	freeList := a.freeIPAs[size]
 	if a.nextIPA < ipaReuseThreshold || len(freeList) == 0 {
-		if a.nextIPA+uint64(size) > ipaMax {
-			return 0, fmt.Errorf("IPA space exhausted (next=%#x, max=%#x)", a.nextIPA, uint64(ipaMax))
+		// Keep every IPA naturally aligned to its mapping size. With a 4K
+		// guest granule, user pages advance nextIPA in 4K steps, while
+		// per-vCPU state pages are 16K mappings translated through the
+		// 16K-granule kernel page table. A misaligned 16K IPA would be
+		// truncated by the kernel PTE and alias unrelated guest pages.
+		ipa = (a.nextIPA + uint64(size) - 1) &^ (uint64(size) - 1)
+		if ipa+uint64(size) > memFileIPABase {
+			return 0, fmt.Errorf("IPA space exhausted (next=%#x, max=%#x)", a.nextIPA, uint64(memFileIPABase))
 		}
-		ipa = a.nextIPA
-		a.nextIPA += uint64(size)
+		a.nextIPA = ipa + uint64(size)
 	} else {
 		ipa = freeList[len(freeList)-1]
 		a.freeIPAs[size] = freeList[:len(freeList)-1]
 	}
 
-	// Determine the VA to pass to hv_vm_map.
-	mapAddr := unsafe.Pointer(hostAddr)
-	if shadow {
-		// Allocate anonymous memory and copy the page content.
-		var anonMem unsafe.Pointer
-		if ret := C.posix_memalign(&anonMem, C.size_t(size), C.size_t(size)); ret != 0 || anonMem == nil {
-			return 0, fmt.Errorf("posix_memalign failed for shadow page (size=%d, ret=%d)", size, ret)
-		}
-		C.memcpy(anonMem, unsafe.Pointer(hostAddr), C.size_t(size))
-		patchIDRegisterReads(anonMem, size)
-		mapAddr = anonMem
-		a.shadowPages[ipa] = anonMem
-	}
-
-	// Map into HVF.
-	ret := C.hv_vm_map(mapAddr, C.hv_ipa_t(ipa), C.size_t(size),
+	ret := C.hv_vm_map(unsafe.Pointer(hostAddr), C.hv_ipa_t(ipa), C.size_t(size),
 		C.HV_MEMORY_READ|C.HV_MEMORY_WRITE|C.HV_MEMORY_EXEC)
 	if ret != C.HV_SUCCESS {
-		if shadow {
-			C.free(a.shadowPages[ipa])
-			delete(a.shadowPages, ipa)
-		}
 		return 0, fmt.Errorf("hv_vm_map(host=%#x, ipa=%#x, len=%d): %d", hostAddr, ipa, size, ret)
 	}
 
@@ -192,12 +143,36 @@ func (a *ipaAllocator) mapPageInternal(hostAddr uintptr, size uintptr, shadow bo
 	return ipa, nil
 }
 
+// prepareExec makes the instruction cache coherent with the page mapped at
+// ipa, which the guest is about to be allowed to execute. The page's current
+// contents may have been written through its host mapping over instructions
+// that are still cached, and CTR_EL0.DIC is 0. This is done once per IPA:
+// later writes to a page that the guest may execute are the writer's
+// responsibility (the guest's own cache maintenance for its stores; like
+// Linux, the sentry does not synchronize existing executable mappings with
+// file writes), and a freed page can only be reused under a new IPA.
+//
+// Preconditions: The caller holds a reference on ipa.
+func (a *ipaAllocator) prepareExec(ipa uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, ok := a.icacheSynced[ipa]; ok {
+		return
+	}
+	C.sys_icache_invalidate(unsafe.Pointer(a.ipaToHost[ipa]), C.size_t(a.ipaSize[ipa]))
+	a.icacheSynced[ipa] = struct{}{}
+}
+
 // unmapIPA decrements the refcount for an IPA mapping. When the
 // refcount reaches zero, the IPA is unmapped from HVF's stage-2.
-// TLB coherency is enforced by:
-//  1. hv_vm_protect permission cycling (forces stage-2 TLB invalidation)
-//  2. The ring0 entry stub (TLBI VMALLE1IS on every guest entry)
+// Callers release IPAs only after no guest PTE references them and no vCPU
+// can hold a stage-1 translation to them (see addressSpace.releaseStaleLocked).
+// MemoryFile IPAs (see memFileMapper) are not reference counted, and are
+// ignored.
 func (a *ipaAllocator) unmapIPA(ipa uint64) {
+	if ipa >= memFileIPABase {
+		return
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -213,6 +188,7 @@ func (a *ipaAllocator) unmapIPA(ipa uint64) {
 		}
 		delete(a.refCount, ipa)
 		delete(a.ipaSize, ipa)
+		delete(a.icacheSynced, ipa)
 
 		// Force stage-2 TLB invalidation for this IPA before unmapping.
 		// ARM64 architecture requires break-before-make: removing permissions
@@ -220,14 +196,61 @@ func (a *ipaAllocator) unmapIPA(ipa uint64) {
 		C.hv_vm_protect(C.hv_ipa_t(ipa), C.size_t(size), 0)
 		C.hv_vm_unmap(C.hv_ipa_t(ipa), C.size_t(size))
 
-		// Free the shadow page if one was allocated.
-		if sp, ok := a.shadowPages[ipa]; ok {
-			C.free(sp)
-			delete(a.shadowPages, ipa)
-		}
-
 		a.freeIPAs[size] = append(a.freeIPAs[size], ipa)
 	}
+}
+
+// memFileMapper maps the sentry's main MemoryFile into the IPA space: each
+// chunk of the file is mapped once, when a guest first maps a page in it, at
+// memFileIPABase plus its file offset, and stays mapped for the VM's lifetime.
+// Guest page tables map MemoryFile pages to these IPAs directly, without a
+// hv_vm_map or ipaAllocator reference per page: a page that is freed keeps
+// its IPA, and flushing the stage-1 translations to it (see
+// addressSpace.releaseStaleLocked) is all that stops guests from reaching it.
+// This relies on the host mapping of each chunk never being replaced while
+// the VM runs (see pgalloc.MemoryFile.ChunkMapping).
+type memFileMapper struct {
+	// mf is the MemoryFile, or nil if there is none. mf is immutable once
+	// address spaces exist.
+	mf *pgalloc.MemoryFile
+
+	mu sync.Mutex
+	// mapped holds the file offsets of the chunks of mf that are mapped.
+	mapped map[uint64]struct{}
+}
+
+// mapRange ensures that the chunks of m.mf spanning fr are mapped, and returns
+// the IPA of fr.Start.
+func (m *memFileMapper) mapRange(fr memmap.FileRange) (uint64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for off := fr.Start; off < fr.End; {
+		chunk, host := m.mf.ChunkMapping(off)
+		off = chunk.End
+		if _, ok := m.mapped[chunk.Start]; ok {
+			continue
+		}
+		ipa := memFileIPABase + chunk.Start
+		if ipa+chunk.Length() > ipaMax {
+			return 0, fmt.Errorf("MemoryFile chunk %v is beyond the IPA space", chunk)
+		}
+		ret := C.hv_vm_map(unsafe.Pointer(host), C.hv_ipa_t(ipa), C.size_t(chunk.Length()),
+			C.HV_MEMORY_READ|C.HV_MEMORY_WRITE|C.HV_MEMORY_EXEC)
+		if ret != C.HV_SUCCESS {
+			return 0, fmt.Errorf("hv_vm_map(host=%#x, ipa=%#x, len=%d): %d", host, ipa, chunk.Length(), ret)
+		}
+		m.mapped[chunk.Start] = struct{}{}
+	}
+	return memFileIPABase + fr.Start, nil
+}
+
+// prepareExec makes the instruction cache coherent with the MemoryFile pages
+// at host addresses [addr, addr+length), which the guest is about to be
+// allowed to execute. Unlike ipaAllocator.prepareExec, this is needed every
+// time: a freed MemoryFile page can be reused for other instructions under
+// the same IPA.
+func (m *memFileMapper) prepareExec(addr, length uintptr) {
+	C.sys_icache_invalidate(unsafe.Pointer(addr), C.size_t(length))
 }
 
 // ptPageAllocator allocates page table pages in the HVF IPA space.
@@ -313,60 +336,4 @@ func (p *ptPageAllocator) freePage(hostMem unsafe.Pointer, ipa uint64, size uint
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.freeList = append(p.freeList, ptPage{hostMem: hostMem, ipa: ipa, size: size})
-}
-
-// patchIDRegisterReads scans a code page for MRS instructions that read
-// ARM64 ID registers (trapped by HVF, causing the vCPU to hang).
-// Replaces them with MOV instructions that load the correct values.
-func patchIDRegisterReads(page unsafe.Pointer, size uintptr) {
-	words := (*[1 << 20]uint32)(page)[:size/4]
-	for i, instr := range words {
-		// MRS Xt, <sysreg>: 1101 0101 0011 .... .... .... .... ....
-		if instr&0xFFF00000 != 0xD5300000 {
-			continue
-		}
-		rt := instr & 0x1f
-		sysreg := (instr >> 5) & 0x7FFF
-
-		var val uint64
-		var name string
-		// Values must match emulateSysreg() in context.go.
-		// Only patch registers whose values fit in 16 bits (MOVZ limit).
-		// Registers with >16-bit values (ISAR0, ISAR1, MIDR) are left
-		// unpatched — they trap to emulateSysreg which returns the full value.
-		switch sysreg {
-		// ID_AA64MMFR0_EL1 (0x4038): value 0x101122 > 16 bits, skip
-		// patching. Trap to emulateSysreg for correct full value.
-		case 0x4039: // ID_AA64MMFR1_EL1
-			val = 0
-			name = "ID_AA64MMFR1_EL1"
-		case 0x403a: // ID_AA64MMFR2_EL1
-			val = 0
-			name = "ID_AA64MMFR2_EL1"
-		case 0x4020: // ID_AA64PFR0_EL1
-			val = 0x0011 // EL0+EL1 AArch64
-			name = "ID_AA64PFR0_EL1"
-		case 0x4021: // ID_AA64PFR1_EL1
-			val = 0
-			name = "ID_AA64PFR1_EL1"
-		case 0x4028: // ID_AA64DFR0_EL1
-			val = 0
-			name = "ID_AA64DFR0_EL1"
-		// MPIDR_EL1 (0x4005): value 0x80000000 > 16 bits, skip patching.
-		// Trap to emulateSysreg which returns the full value.
-		case 0x4102: // TCR_EL1 (S3_0_C2_C0_2) — EL0 read traps here
-			val = 0
-			name = "TCR_EL1"
-		// ID_AA64ISAR0/1, MIDR: values >16 bits, skip patching.
-		// They trap to emulateSysreg() which returns the full value.
-		default:
-			continue
-		}
-
-		// Replace MRS with MOVZ Xt, #imm16.
-		// All patched values fit in 16 bits (>16-bit registers are
-		// skipped above and trap to emulateSysreg instead).
-		words[i] = 0xD2800000 | (uint32(val) << 5) | rt
-		log.Debugf("patched MRS %s → x%d at page offset %d", name, rt, i*4)
-	}
 }

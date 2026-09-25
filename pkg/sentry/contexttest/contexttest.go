@@ -28,12 +28,11 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
-	"gvisor.dev/gvisor/pkg/sentry/platform/ptrace"
 	"gvisor.dev/gvisor/pkg/sentry/uniqueid"
 )
 
-// Context returns a Context that may be used in tests. Uses ptrace as the
-// platform.Platform.
+// Context returns a Context that may be used in tests. Uses the host OS's test
+// platform.Platform (see newPlatform).
 //
 // Note that some filesystems may require a minimal kernel for testing, which
 // this test context does not provide. For such tests, see kernel/contexttest.
@@ -51,7 +50,7 @@ func Context(tb testing.TB) context.Context {
 		memfile.Close()
 		tb.Fatalf("error creating pgalloc.MemoryFile: %v", err)
 	}
-	p, err := ptrace.New()
+	p, err := newPlatform()
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -147,7 +146,7 @@ func (t *TestContext) Value(key any) any {
 }
 
 // RootContext returns a Context that may be used in tests that need root
-// credentials. Uses ptrace as the platform.Platform.
+// credentials. Uses the same platform.Platform as Context.
 func RootContext(tb testing.TB) context.Context {
 	return auth.ContextWithCredentials(Context(tb), auth.NewRootCredentials(auth.NewRootUserNamespace()))
 }

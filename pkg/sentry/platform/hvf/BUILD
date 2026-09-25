@@ -31,6 +31,7 @@ go_library(
         "//pkg/log",
         "//pkg/sentry/arch",
         "//pkg/sentry/memmap",
+        "//pkg/sentry/pgalloc",
         "//pkg/sentry/platform",
         "//pkg/sentry/platform/interrupt",
         "//pkg/sync",

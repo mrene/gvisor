@@ -757,8 +757,12 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 		}
 		readerDsts := dsts.TakeFirst64(origLength)
 		n, err := safemem.ReadFullToBlocks(alloc.opts.ReaderFunc, readerDsts)
-		un := uint64(hostarch.Addr(n).RoundDown())
-		if un < length {
+		// Round to the guest page size: origLength need not be a multiple of
+		// the host page size, and rounding a complete fill down to host pages
+		// would discard filled guest pages (all of them for fills smaller
+		// than a host page), returning a short allocation without an error.
+		un := uint64(hostarch.Addr(n).GuestRoundDown())
+		if un < origLength {
 			// Free unused memory and update fr to contain only the memory that is
 			// still allocated.
 			f.DecRef(memmap.FileRange{fr.Start + un, fr.End})
@@ -1063,11 +1067,11 @@ func tryPopulate(b safemem.Block) bool {
 // Decommit uncommits the given pages, causing them to become zeroed.
 //
 // Preconditions:
-//   - fr.Start and fr.End must be page-aligned.
+//   - fr.Start and fr.End must be guest-page-aligned.
 //   - fr.Length() > 0.
 //   - At least one reference must be held on all pages in fr.
 func (f *MemoryFile) Decommit(fr memmap.FileRange) {
-	if !fr.WellFormed() || fr.Length() == 0 || fr.Start%hostarch.PageSize != 0 || fr.End%hostarch.PageSize != 0 {
+	if !fr.WellFormed() || fr.Length() == 0 || !hostarch.IsGuestPageAligned(fr.Start) || !hostarch.IsGuestPageAligned(fr.End) {
 		panic(fmt.Sprintf("invalid range: %v", fr))
 	}
 
@@ -1109,6 +1113,28 @@ func (f *MemoryFile) manuallyZero(fr memmap.FileRange) {
 }
 
 func (f *MemoryFile) decommitOrManuallyZero(fr memmap.FileRange) {
+	// Host decommit operates on whole host pages. With guest pages smaller
+	// than host pages (4K guest pages on 16K macOS hosts), a released range
+	// can share host pages with live allocations, and punching a hole in
+	// part of a host page can lose the contents of those live neighbors.
+	// Zero partial host pages manually and decommit only whole host pages.
+	if hostarch.GuestPageSize < hostarch.PageSize {
+		inner := memmap.FileRange{
+			Start: (fr.Start + hostarch.PageSize - 1) &^ (hostarch.PageSize - 1),
+			End:   fr.End &^ (hostarch.PageSize - 1),
+		}
+		if inner.Start >= inner.End {
+			f.manuallyZero(fr)
+			return
+		}
+		if fr.Start < inner.Start {
+			f.manuallyZero(memmap.FileRange{Start: fr.Start, End: inner.Start})
+		}
+		if inner.End < fr.End {
+			f.manuallyZero(memmap.FileRange{Start: inner.End, End: fr.End})
+		}
+		fr = inner
+	}
 	if err := f.decommitFile(fr); err != nil {
 		if err != unix.ENOSYS {
 			log.Warningf("Failed to decommit %v: %v", fr, err)
@@ -1438,6 +1464,18 @@ func (f *MemoryFile) MapInternal(fr memmap.FileRange, at hostarch.AccessType) (s
 		blocks = append(blocks, safemem.BlockFromSafeSlice(bs))
 	})
 	return safemem.BlockSeqFromSlice(blocks), nil
+}
+
+// ChunkMapping returns the range of f's backing file spanned by the chunk
+// containing off, and the address of the chunk's mapping in the sentry.
+// Chunks are never unmapped or remapped before f is destroyed, except by
+// LoadFrom, so a caller may alias a chunk's mapping (e.g. into a VM's
+// guest-physical address space) until then.
+//
+// Preconditions: off is within a range allocated from f.
+func (f *MemoryFile) ChunkMapping(off uint64) (memmap.FileRange, uintptr) {
+	start := off &^ chunkMask
+	return memmap.FileRange{start, start + chunkSize}, f.chunksLoad()[off/chunkSize].mapping
 }
 
 // forEachMappingSlice invokes fn on a sequence of byte slices that

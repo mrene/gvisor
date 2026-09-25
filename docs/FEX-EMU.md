@@ -5,8 +5,9 @@ ARM64 at runtime. Running FEX inside gVisor on macOS enables x86_64
 workloads on Apple Silicon without a full x86 virtual machine.
 
 **Status:** FEX loads all shared libraries and starts the interpreter.
-The original string table corruption crash is fixed. A remaining L3
-permission fault loop on COW break blocks full execution.
+The original string table corruption crash is fixed. A fault loop on
+copy-on-write then blocked execution; its likely cause is fixed, but FEX
+has not been retested.
 
 | Milestone | Status |
 |-----------|--------|
@@ -14,7 +15,7 @@ permission fault loop on COW break blocks full execution.
 | Shared libraries (libstdc++, libc, libm, libgcc_s, ld.so) | Working |
 | glibc ld.so loads (MAP_FIXED fix) | Working |
 | String table crash (0x4700312e6f7331d9) | Fixed |
-| x86_64 code translation | Blocked (L3 permission fault loop) |
+| x86_64 code translation | Not retested since the fault loop fix |
 
 ## Root Cause: The page4KRound Problem
 
@@ -149,30 +150,24 @@ codesign -s - --entitlements cmd/sentrydarwin/entitlements.plist -f ./sentrydarw
   set_robust_list). `rseq` returns ENOSYS (gVisor does not implement
   restartable sequences), which FEX handles gracefully.
 
-### Remaining Issue: L3 Permission Fault Loop
+### Fault Loop on Copy-on-Write (likely fixed, not retested)
 
-When FEX begins translating x86_64 code, it writes to COW (copy-on-write)
-pages. If the backing IPA for a file-backed private page is not aligned
-to 16K, the COW break triggers an L3 permission fault loop:
+When FEX began translating x86_64 code, a write to a copy-on-write page
+faulted on the same address indefinitely. This was attributed to HVF not
+applying in-place AP (permission) upgrades for IPAs that are not
+16K-aligned.
 
-1. Guest writes to a COW page (AP[2]=1, read-only).
-2. `HandleUserFault` performs the COW break: allocates a new physical
-   page, copies data, updates the L3 PTE to AP[2]=0 (read-write).
-3. The guest retries the write.
-4. The write faults again with the same L3 permission fault.
-5. Steps 2-4 repeat indefinitely.
+A copy-on-write break does not upgrade a PTE in place, though: it maps a new
+page. The loop matches a sentry bug fixed since. `HandleUserFault` rounded
+the faulting address down to 16K and obtained pmas only within the vma
+containing that rounded address. When the 16K page started in the previous
+vma (for example the segment before a writable data segment), the faulting
+page was never mapped writable and never had its copy-on-write broken, so
+the same fault recurred. The fault range is now clamped to the faulting vma
+(`mm.HandleUserFault`), and all memory syscalls are exact at 4K.
 
-**Root cause:** Apple Silicon's HVF implementation does not correctly
-handle 4K granule page table permission upgrades (read-only to
-read-write) via in-place AP bit modification when the IPA is not
-aligned to the host's native 16K page boundary. The stage-2 TLB
-retains the old read-only permission.
-
-**Workaround under investigation:** Instead of changing AP bits
-in-place for COW breaks, allocate a new IPA, copy the page data, and
-remap the L3 PTE to the new IPA. This avoids the in-place permission
-upgrade entirely. The cost is one extra page copy and IPA allocation
-per COW break on affected pages.
+FEX has not been rerun since; the [setup](#setup) needs an Ubuntu rootfs
+built with Docker.
 
 ## Debugging Notes
 

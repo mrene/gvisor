@@ -24,7 +24,7 @@ import (
 
 // DetachShm unmaps a sysv shared memory segment.
 func (mm *MemoryManager) DetachShm(ctx context.Context, addr hostarch.Addr) error {
-	if addr != addr.RoundDown() {
+	if addr != addr.GuestRoundDown() {
 		// "... shmaddr is not aligned on a page boundary." - man shmdt(2)
 		return linuxerr.EINVAL
 	}

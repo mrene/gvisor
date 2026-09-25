@@ -131,6 +131,18 @@ func (c *vCPU) initialize() error {
 
 	// Mask the virtual timer to prevent spurious timer interrupts.
 	C.hv_vcpu_set_vtimer_mask(c.vcpuID, C.bool(true))
+	// Keep the virtual timer disabled: el0_sync uses CNTV_CVAL_EL0 as a
+	// scratch register for guest X16.
+	if err := c.setSysReg(C.HV_SYS_REG_CNTV_CTL_EL0, 0); err != nil {
+		return fmt.Errorf("set CNTV_CTL_EL0: %w", err)
+	}
+	// The guest's CNTVCT_EL0 is mach_absolute_time() minus this offset. The
+	// VDSO computes time from CNTVCT_EL0 with parameters that the sentry
+	// calibrates against mach_absolute_time() (see sentry/time.Rdtsc on
+	// darwin), so the two must be the same counter.
+	if ret := C.hv_vcpu_set_vtimer_offset(c.vcpuID, 0); ret != C.HV_SUCCESS {
+		return fmt.Errorf("hv_vcpu_set_vtimer_offset: %d", ret)
+	}
 
 	// Point this vCPU to the shared exception vectors.
 	if err := c.setSysReg(C.HV_SYS_REG_VBAR_EL1, c.machine.vectorsAddr); err != nil {
@@ -223,39 +235,25 @@ func (m *machine) setupSharedMemory() error {
 	}
 	C.memset(vecMem, 0, C.size_t(vectorsPageSize))
 
-	// ARM64 exception vector table layout (VBAR_EL1-relative offsets):
+	// ARM64 exception vector table layout (VBAR_EL1-relative offsets).
+	// Each of the 16 entries is 128 bytes; entry i exits to the host with
+	// HVC #(vectorHVCBase+i) unless replaced below:
 	//
-	// Current EL, SP_EL0:
-	//   0x000: Synchronous  → HVC #0
-	//   0x080: IRQ          → HVC #1
-	//   0x100: FIQ          → HVC #2
-	//   0x180: SError       → HVC #3
+	//   0x000-0x180: Current EL, SP_EL0 (sync, IRQ, FIQ, SError)
+	//   0x200-0x380: Current EL, SP_ELx; 0x200 (sync) is the TLB retry
+	//                handler below
+	//   0x400-0x580: Lower EL, AArch64; 0x400 (sync) is el0_sync, which
+	//                exits with HVC #9 for SVC and HVC #8 for other
+	//                exceptions
+	//   0x600-0x780: Lower EL, AArch32 (unused); 0x600 holds the rest of
+	//                the el0_sync SVC path
 	//
-	// Current EL, SP_ELx:
-	//   0x200: Synchronous  → HVC #4
-	//   0x280: IRQ          → HVC #5
-	//   0x300: FIQ          → HVC #6
-	//   0x380: SError       → HVC #7
-	//
-	// Lower EL, AArch64 (EL0 traps — sentry-as-ring0):
-	//   0x400: Synchronous  → HVC #8  (el0_sync: SVC syscalls, faults)
-	//   0x480: IRQ          → HVC #9
-	//   0x500: FIQ          → HVC #10
-	//   0x580: SError       → HVC #11
-	//
-	// Lower EL, AArch32 (unused, but must be present):
-	//   0x600: Synchronous  → HVC #12
-	//   0x680: IRQ          → HVC #13
-	//   0x700: FIQ          → HVC #14
-	//   0x780: SError       → HVC #15
-	//
-	// Each entry is 128 bytes (32 instructions). Most entries forward
-	// to the hypervisor via HVC #i. The el0_sync handler at 0x400
-	// reads ESR_EL1 to classify SVC vs fault and exits with HVC #9
-	// or HVC #8 respectively.
+	// Starting the generic immediates at vectorHVCBase keeps them distinct
+	// from the el0_sync exits: an IRQ taken from EL0 (0x480) must not look
+	// like a syscall.
 	vectors := make([]byte, vectorsPageSize)
-	for i := 0; i < 16; i++ {
-		hvcInstr := uint32(0xd4000002) | (uint32(i) << 5) // HVC #i
+	for i := range 16 {
+		hvcInstr := uint32(0xd4000002) | (uint32(vectorHVCBase+i) << 5)
 		binary.LittleEndian.PutUint32(vectors[i*128:], hvcInstr)
 	}
 	// 0x200 (current-EL SPx sync): TLB fault recovery.
@@ -283,99 +281,59 @@ func (m *machine) setupSharedMemory() error {
 	// Other: save ESR to X18, exit HVC #8.
 	// State page mapped in TTBR1 with AP[1]=0 (EL1-only), so PAN
 	// does not block access. TPIDR_EL1 holds state page kernel VA.
+	//
+	// Linux preserves every EL0 GP register except the syscall result
+	// across exceptions, and compilers use X16-X18 as ordinary
+	// temporaries. The handler therefore first stashes guest X16-X18 in
+	// EL1-owned system registers (see msrCNTVCVALX16 et al.), without touching
+	// memory, and every return path restores them.
 	{
 		off := 0x400
 		put := func(instr uint32) {
 			binary.LittleEndian.PutUint32(vectors[off:], instr)
 			off += 4
 		}
-		// In-VM syscall fast-path via ERET (no VM exit for known syscalls).
-		// Table dispatch for syscalls 172-178 (getpid..gettid).
-		// Patchable MOVZ instructions at known offsets for per-task values.
-		// Clobbers: X16, X17 (caller-saved), X18 (platform-reserved).
+		put(msrCNTVCVALX16) // MSR CNTV_CVAL_EL0, X16
+		put(movSPX17)       // MOV SP, X17 (SP_EL1)
+		put(msrTPIDRROX18)  // MSR TPIDRRO_EL0, X18
+		// SVC continues at 0x600, which saves the guest registers and
+		// exits. No syscall is handled inside the VM: every return to EL0
+		// goes through an entry stub (and its TLBI), and every EL1
+		// handler path ends in an HVC exit. Switch relies on both.
 		put(0xd5385212) // MRS X18, ESR_EL1
 		put(0xd35afe51) // LSR X17, X18, #26
 		put(0x7100563f) // CMP W17, #0x15     (SVC?)
-		put(0x540002c1) // B.NE .+88          (→ fault)
-		put(0xd102b111) // SUB X17, X8, #172
-		put(0xf1001a3f) // CMP X17, #6
-		put(0x54000248) // B.HI .+72          (→ slow)
-		put(0x10000070) // ADR X16, .+12      (→ table)
-		put(0x8b110e10) // ADD X16, X16, X17, LSL #3
-		put(0xd61f0200) // BR X16
-		// table[0]: getpid(172)  PATCHABLE at vectors[0x428]
-		put(0xd2800020) // MOV X0, #1
-		put(0xd69f03e0) // ERET
-		// table[1]: getppid(173) PATCHABLE at vectors[0x430]
-		put(0xd2800000) // MOV X0, #0
-		put(0xd69f03e0) // ERET
-		// table[2]: getuid(174)  PATCHABLE at vectors[0x438]
-		put(0xd2800000) // MOV X0, #0
-		put(0xd69f03e0) // ERET
-		// table[3]: geteuid(175) PATCHABLE at vectors[0x440]
-		put(0xd2800000) // MOV X0, #0
-		put(0xd69f03e0) // ERET
-		// table[4]: getgid(176)  PATCHABLE at vectors[0x448]
-		put(0xd2800000) // MOV X0, #0
-		put(0xd69f03e0) // ERET
-		// table[5]: getegid(177) PATCHABLE at vectors[0x450]
-		put(0xd2800000) // MOV X0, #0
-		put(0xd69f03e0) // ERET
-		// table[6]: gettid(178)  PATCHABLE at vectors[0x458]
-		put(0xd2800020) // MOV X0, #1
-		put(0xd69f03e0) // ERET
-		// slow: branch to extended handler at 0x600
-		put(0x14000068) // B .+0x1A0 (→ 0x600)
+		put(0x54000041) // B.NE .+8           (→ fault)
+		put(encodeB(off, 0x600))
 		// fault: save ESR to X18, exit via HVC #8.
 		// No STP chain for faults — TLB always cold after ASIDE1IS,
 		// recovery overhead (~300ns) outweighs API savings.
 		put(0xd5385212) // MRS X18, ESR_EL1
 		put(0xd4000102) // HVC #8
+		if off > 0x480 {
+			panic(fmt.Sprintf("el0_sync handler overflows its vector slot: %#x", off))
+		}
 	}
 
-	// Extended syscall handler at 0x600 (AArch32 vector space, unused).
-	// Handles syscalls not in the 172-178 table dispatch.
+	// SVC save path at 0x600 (AArch32 vector space, unused).
 	{
 		off := 0x600
 		put := func(instr uint32) {
 			binary.LittleEndian.PutUint32(vectors[off:], instr)
 			off += 4
 		}
-		// sched_yield(124) — bypasses t.Yield(), safe for single-task.
-		put(0xf101f11f) // CMP X8, #124
-		put(0x54000061) // B.NE .+12
-		put(0xd2800000) // MOV X0, #0
-		put(0xd69f03e0) // ERET
-		// getpgid(155) when X0==0
-		put(0xf1026d1f) // CMP X8, #155
-		put(0x54000081) // B.NE .+16 (→ getsid check)
-		put(0xb5000100) // CBNZ X0, .+32 (→ slow)
-		put(0xd2800020) // MOV X0, #1  PATCHABLE at vectors[0x61C]
-		put(0xd69f03e0) // ERET
-		// getsid(156) when X0==0
-		put(0xf102711f) // CMP X8, #156
-		put(0x54000081) // B.NE .+16 (→ slow)
-		put(0xb5000060) // CBNZ X0, .+12 (→ slow)
-		put(0xd2800020) // MOV X0, #1  PATCHABLE at vectors[0x630]
-		put(0xd69f03e0) // ERET
-		// set_tid_address(96): NOT fast-pathed. It must call
-		// SetClearTID for pthread_join/CLONE_CHILD_CLEARTID to work.
-		// Falls through to slow path.
-		//
 		// Save guest ELR/SPSR to X17/X18 before the STP chain.
 		// If the STP chain triggers a TLB fault (0x200 handler),
 		// SPSR/ELR system regs are overwritten by the current-EL
 		// exception. But the simplified 0x200 handler (TLBI+ERET)
 		// preserves all GP registers, so X17/X18 survive. The STP
-		// chain then stores X17/X18 to the state page. The sentry
-		// reads them: X17 from API (guest PC), X18 from state page
-		// (guest PSTATE). X17/X18 are already sacrificial (clobbered
-		// by el0_sync's ESR check).
+		// chain then stores X18 to the state page. The sentry reads
+		// X17 from API (guest PC), X18 from state page (guest
+		// PSTATE), and guest X16-X18 from the vector scratch
+		// registers.
 		put(0xd5384031) // MRS X17, ELR_EL1
 		put(0xd5384012) // MRS X18, SPSR_EL1
-		put(0xd503201f) // NOP
-		put(0xd503201f) // NOP
-		// slow: save X0-X30 to state page, then HVC #9.
+		// Save X0-X30 to state page, then HVC #9.
 		// Full STP chain. Cold TLB → fault to 0x200 → TLBI+ERET retry.
 		put(0xd538d090) // MRS X16, TPIDR_EL1
 		stpEnc := func(rt1, rt2, rn, byteOff int) uint32 {
@@ -399,38 +357,33 @@ func (m *machine) setupSharedMemory() error {
 		put(0xd4000122) // HVC #9
 	}
 
-	// Single-instruction ERET at 0x800 (unused, kept for compat).
-	// Sigreturn trampoline immediately follows at 0x804.
-	binary.LittleEndian.PutUint32(vectors[0x800:], 0xd69f03e0) // ERET
-
-	// ERET stub at 0x810: TLBI ASIDE1IS by current ASID, then ERET.
-	// GP regs are loaded via HVF API (loadGPRegs) before entry.
+	// Entry stubs. The first does TLBI ASIDE1IS by the current ASID, then
+	// ERET. GP regs are loaded via HVF API (loadGPRegs) before entry. X17 is
+	// needed for the ASID, so stash the guest value in SP_EL1.
 	{
-		off := 0x810
+		off := entryStubOff
 		put := func(instr uint32) {
 			binary.LittleEndian.PutUint32(vectors[off:], instr)
 			off += 4
 		}
-		put(0xd5382011) // MRS X17, TTBR0_EL1 (ASID)
-		put(0xd5088351) // TLBI ASIDE1IS, X17
-		put(0xd5033b9f) // DSB ISH
-		put(0xd5033fdf) // ISB
-		put(0xd69f03e0) // ERET
+		put(movSPX17)      // MOV SP, X17
+		put(0xd5382011)    // MRS X17, TTBR0_EL1 (ASID)
+		put(0xd5088351)    // TLBI ASIDE1IS, X17
+		put(0xd5033b9f)    // DSB ISH
+		put(0xd5033fdf)    // ISB
+		put(movX17SP)      // MOV X17, SP
+		put(msrTPIDRROXZR) // MSR TPIDRRO_EL0, XZR
+		put(0xd69f03e0)    // ERET
 
-		// Full TLBI stub at 0x828 — used on ASID wrap.
-		binary.LittleEndian.PutUint32(vectors[0x828:], 0xd508831f) // TLBI VMALLE1IS
-		binary.LittleEndian.PutUint32(vectors[0x82c:], 0xd5033b9f) // DSB ISH
-		binary.LittleEndian.PutUint32(vectors[0x830:], 0xd5033fdf) // ISB
-		binary.LittleEndian.PutUint32(vectors[0x834:], 0xd69f03e0) // ERET
-		m.fullTLBIStubOff = 0x828
+		// Full TLBI stub — used on ASID wrap.
+		m.fullTLBIStubOff = uint64(off)
+		put(0xd508831f)    // TLBI VMALLE1IS
+		put(0xd5033b9f)    // DSB ISH
+		put(0xd5033fdf)    // ISB
+		put(msrTPIDRROXZR) // MSR TPIDRRO_EL0, XZR
+		put(0xd69f03e0)    // ERET
+		m.entryStubsEnd = uint64(off)
 	}
-
-	// Sigreturn trampoline at offset 0x804. Used as the signal
-	// restorer (R30) when SA_RESTORER is not set. Executes:
-	//   MOV X8, #139    // SYS_RT_SIGRETURN
-	//   SVC #0
-	binary.LittleEndian.PutUint32(vectors[0x804:], 0xd2801168) // MOV X8, #139
-	binary.LittleEndian.PutUint32(vectors[0x808:], 0xd4000001) // SVC #0
 
 	C.memcpy(vecMem, unsafe.Pointer(&vectors[0]), C.size_t(len(vectors)))
 
@@ -485,89 +438,65 @@ const (
 	spOffsetDispatchVA = 0x200 // Kernel VA of dispatch code page
 )
 
-// Offsets of patchable MOVZ X0,#imm instructions in the vectors page.
-// Table entries at 0x428 + index*8 (8 bytes per entry: MOVZ + ERET).
+// The el0_sync vector stashes guest X16-X18 in EL1-owned system registers
+// before using them as temporaries. None of these accesses touch memory, so
+// they cannot fault before the exception syndrome has been captured.
+//   - X16: CNTV_CVAL_EL0. The virtual timer is disabled and EL0 cannot
+//     access it (CNTKCTL_EL1.EL0VTEN=0).
+//   - X17: SP_EL1. EL1 code in the vectors page never uses a stack.
+//   - X18: TPIDRRO_EL0. It is cleared before every return to EL0, as Linux
+//     does for native AArch64 tasks.
 const (
-	fastPathGetpidOff  = 0x428 // table[0]: getpid(172)
-	fastPathGetppidOff = 0x430 // table[1]: getppid(173)
-	fastPathGetuidOff  = 0x438 // table[2]: getuid(174)
-	fastPathGeteuidOff = 0x440 // table[3]: geteuid(175)
-	fastPathGetgidOff  = 0x448 // table[4]: getgid(176)
-	fastPathGetegidOff = 0x450 // table[5]: getegid(177)
-	fastPathGettidOff  = 0x458 // table[6]: gettid(178)
-	// Extended handler (0x600+)
-	fastPathGetpgidOff  = 0x61C // getpgid(155) when X0==0
-	fastPathGetsidOff   = 0x630 // getsid(156) when X0==0
-	// set_tid_address removed from fast path (needs SetClearTID)
+	msrCNTVCVALX16 = 0xd51be350 // MSR CNTV_CVAL_EL0, X16
+	movSPX17       = 0x9100023f // MOV SP, X17
+	movX17SP       = 0x910003f1 // MOV X17, SP
+	msrTPIDRROX18  = 0xd51bd072 // MSR TPIDRRO_EL0, X18
+	msrTPIDRROXZR  = 0xd51bd07f // MSR TPIDRRO_EL0, XZR
 )
 
-// encodeMOVZ returns the ARM64 encoding for MOVZ X0, #imm16.
-func encodeMOVZ(val uint16) uint32 {
-	return 0xD2800000 | (uint32(val) << 5)
-}
+const (
+	// vectorHVCBase is the HVC immediate of exception vector 0; vector i
+	// exits with HVC #(vectorHVCBase+i) unless it has its own handler.
+	// Exit HVCs must not use immediate 0: HVF answers HVC #0 itself,
+	// without exiting, when W0 holds certain SMCCC function IDs (e.g.
+	// 0xC1xxxxxx), and live guest X0 is often such a value.
+	vectorHVCBase = 0x10
 
-// PatchFastPathSyscalls writes per-task return values into the
-// vectors page's patchable MOVZ slots.
-//
-// WARNING: The vectors page is shared across all vCPUs and address
-// spaces. These values are only correct for the init process. After
-// fork, child processes will see the parent's PID/TID/UID. A proper
-// fix would move these values to the per-vCPU state page.
-func (m *machine) PatchFastPathSyscalls(pid, ppid, tid, uid, euid, gid, egid, pgid, sid uint16) {
-	vec := (*[vectorsPageSize]byte)(m.vectorsMem)
-	binary.LittleEndian.PutUint32(vec[fastPathGetpidOff:], encodeMOVZ(pid))
-	binary.LittleEndian.PutUint32(vec[fastPathGetppidOff:], encodeMOVZ(ppid))
-	binary.LittleEndian.PutUint32(vec[fastPathGetuidOff:], encodeMOVZ(uid))
-	binary.LittleEndian.PutUint32(vec[fastPathGeteuidOff:], encodeMOVZ(euid))
-	binary.LittleEndian.PutUint32(vec[fastPathGetgidOff:], encodeMOVZ(gid))
-	binary.LittleEndian.PutUint32(vec[fastPathGetegidOff:], encodeMOVZ(egid))
-	binary.LittleEndian.PutUint32(vec[fastPathGettidOff:], encodeMOVZ(tid))
-	binary.LittleEndian.PutUint32(vec[fastPathGetpgidOff:], encodeMOVZ(pgid))
-	binary.LittleEndian.PutUint32(vec[fastPathGetsidOff:], encodeMOVZ(sid))
-}
+	// entryStubOff is the vectors-page offset of the first entry stub.
+	// The stubs end at machine.entryStubsEnd.
+	entryStubOff = 0x810
+)
 
-// SigreturnAddr is the guest VA of the sigreturn trampoline in the
-// vectors page (offset 0x804). Used as the signal restorer (R30).
-const SigreturnAddr = 0x804
+// encodeB returns the ARM64 encoding for an unconditional branch from the
+// instruction at vectors-page offset from to offset to.
+func encodeB(from, to int) uint32 {
+	return 0x14000000 | uint32((to-from)/4)&0x03ffffff
+}
 
 // loadRegisters loads application registers from arch.Context64 into the vCPU
-// and sets up the EL1-to-EL0 transition via ERET.
-// If skipAll is true, skip all register loading (regs unchanged since last exit).
-func (c *vCPU) loadRegisters(ac *arch.Context64, skipAll bool) {
-	if skipAll {
-		// Bare ERET — GP regs unchanged, no TLBI needed.
-		// Must restore ELR/SPSR because the 0x200 TLB fault handler
-		// or HVF cancel may have clobbered them.
-		c.setSysReg(C.HV_SYS_REG_ELR_EL1, ac.Regs.Pc)
-		c.setSysReg(C.HV_SYS_REG_SPSR_EL1, ac.Regs.Pstate&^0xf)
-		c.setReg(C.HV_REG_PC, c.machine.vectorsAddr+0x800)
-		c.setReg(C.HV_REG_CPSR, 0x3c5)
-		return
-	}
-
+// and sets up the EL1-to-EL0 transition via ERET. FP/SIMD registers are only
+// loaded if loadFP is set: otherwise the vCPU still holds the application's
+// FP state from its last exit, which the sentry has not changed.
+func (c *vCPU) loadRegisters(ac *arch.Context64, loadFP bool) {
 	regs := &ac.Regs
 
 	C.loadGPRegs(c.vcpuID, (*C.uint64_t)(unsafe.Pointer(&regs.Regs[0])))
 	c.setSysReg(C.HV_SYS_REG_SP_EL0, regs.Sp)
 	c.setSysReg(C.HV_SYS_REG_TPIDR_EL0, regs.TPIDR_EL0)
 
-	// FP regs: only load on first entry or after signal delivery
-	// (when the sentry modifies FP state). The guest's FP state stays
-	// in the vCPU between exits — the sentry never touches it.
-	if !c.fpLoaded {
+	if loadFP {
 		fpData := ac.FloatingPointData()
 		if fpData != nil && len(*fpData) >= 528 {
 			C.loadFPRegs(c.vcpuID, unsafe.Pointer(&(*fpData)[8]))
 			runtime.KeepAlive(fpData)
 		}
-		c.fpLoaded = true
 	}
 
 	c.setSysReg(C.HV_SYS_REG_ELR_EL1, regs.Pc)
 	spsr := regs.Pstate &^ 0xf
 	c.setSysReg(C.HV_SYS_REG_SPSR_EL1, spsr)
 
-	eretStub := c.machine.vectorsAddr + 0x810
+	eretStub := c.machine.vectorsAddr + entryStubOff
 	if c.asidWrapped {
 		eretStub = c.machine.vectorsAddr + c.machine.fullTLBIStubOff
 		c.asidWrapped = false
@@ -577,9 +506,11 @@ func (c *vCPU) loadRegisters(ac *arch.Context64, skipAll bool) {
 }
 
 // saveRegisters saves vCPU registers back to arch.Context64.
-// When gpInStatePage is set (HVC #8/#9 exits with STP chain), GP regs
+// When gpInStatePage is set (HVC #9 exits with STP chain), GP regs
 // are read from the state page. Otherwise falls back to API calls
 // (for EC=0x18 traps, direct data aborts, etc. that bypass our handler).
+// When gpInVectorScratch is set (HVC #8/#9 from el0_sync), guest X16-X18
+// are read from the vector scratch registers.
 func (c *vCPU) saveRegisters(ac *arch.Context64) {
 	regs := &ac.Regs
 
@@ -600,12 +531,15 @@ func (c *vCPU) saveRegisters(ac *arch.Context64) {
 		// survive even if the STP chain faulted and retried.
 		regs.Pc = regs.Regs[17]
 		regs.Pstate = regs.Regs[18] &^ 0xf
-		regs.Regs[16] = 0
-		regs.Regs[17] = 0
-		regs.Regs[18] = 0
 	} else {
 		regs.Pc = c.getSysReg(C.HV_SYS_REG_ELR_EL1)
 		regs.Pstate = c.getSysReg(C.HV_SYS_REG_SPSR_EL1) &^ 0xf
+	}
+	if c.gpInVectorScratch {
+		regs.Regs[16] = c.getSysReg(C.HV_SYS_REG_CNTV_CVAL_EL0)
+		regs.Regs[17] = c.getSysReg(C.HV_SYS_REG_SP_EL1)
+		regs.Regs[18] = c.getSysReg(C.HV_SYS_REG_TPIDRRO_EL0)
+		c.gpInVectorScratch = false
 	}
 	regs.TPIDR_EL0 = c.getSysReg(C.HV_SYS_REG_TPIDR_EL0)
 
@@ -619,6 +553,30 @@ func (c *vCPU) saveRegisters(ac *arch.Context64) {
 			runtime.KeepAlive(fpData)
 		}
 	}
+}
+
+// saveEL0Registers saves the application state of a vCPU that exited to the
+// host directly from EL0: an asynchronous hv_vcpus_exit, or an exception
+// routed to the hypervisor instead of the EL1 vectors. The state is in the
+// registers themselves; ELR_EL1/SPSR_EL1 still describe the last entry, and
+// the el0_sync scratch registers are not in use.
+func (c *vCPU) saveEL0Registers(ac *arch.Context64) {
+	c.gpInStatePage = false
+	c.gpInVectorScratch = false
+	c.saveRegisters(ac)
+	ac.Regs.Pc = c.getReg(C.HV_REG_PC)
+	ac.Regs.Pstate = c.getReg(C.HV_REG_CPSR) &^ 0xf
+}
+
+// atEL0 returns true if the vCPU stopped at EL0 (AArch64 EL0t).
+func (c *vCPU) atEL0() bool {
+	return c.getReg(C.HV_REG_CPSR)&0x1f == 0
+}
+
+// inEntryStub returns true if pc (at EL1) is in an entry stub, i.e. the vCPU
+// is between loadRegisters and its return to EL0.
+func (m *machine) inEntryStub(pc uint64) bool {
+	return pc >= m.vectorsAddr+entryStubOff && pc < m.vectorsAddr+m.entryStubsEnd
 }
 
 // getExitReason returns the exit reason from the vCPU exit info.

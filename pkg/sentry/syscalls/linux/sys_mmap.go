@@ -36,19 +36,6 @@ func Brk(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *k
 	return uintptr(addr), nil, nil
 }
 
-// page4KRound rounds a 4K-aligned address and length to 16K boundaries
-// for the mm layer on hosts with 16K pages (macOS ARM64).
-func page4KRound(addr hostarch.Addr, length uint64, offset uint64) (hostarch.Addr, uint64, uint64) {
-	aligned := addr & ^hostarch.Addr(hostarch.PageSize-1)
-	delta := uint64(addr - aligned)
-	newLen := (length + delta + uint64(hostarch.PageSize-1)) & ^uint64(hostarch.PageSize-1)
-	var newOffset uint64
-	if offset >= delta {
-		newOffset = offset - delta
-	}
-	return aligned, newLen, newOffset
-}
-
 // Mmap implements Linux syscall mmap(2).
 func Mmap(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	prot := args[2].Int()
@@ -150,63 +137,14 @@ func Mmap(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *
 		opts.NameMut = memmap.NameMutAnon
 	}
 
-	// In page4K mode, round addresses/lengths to 16K for the mm layer.
-	var origAddr hostarch.Addr
-	if mm.Page4KMode() {
-		// Sub-16K PROT_NONE MAP_FIXED: no-op (4K guard page).
-		if opts.Fixed && !opts.Perms.Any() && opts.Length < uint64(hostarch.PageSize) {
-			return uintptr(opts.Addr), nil, nil
-		}
-		origAddr = opts.Addr
-		if opts.Addr&0xFFF == 0 && opts.Addr&hostarch.Addr(hostarch.PageSize-1) != 0 {
-			newAddr, newLen, newOff := page4KRound(opts.Addr, opts.Length, opts.Offset)
-			opts.Addr = newAddr
-			opts.Length = newLen
-			if opts.Mappable != nil {
-				opts.Offset = newOff
-			}
-		}
-		if opts.Length > 0 && opts.Length < uint64(hostarch.PageSize) {
-			opts.Length = uint64(hostarch.PageSize)
-		}
-	}
-
 	rv, err := t.MemoryManager().MMap(t, opts)
-	if err != nil {
-		return 0, nil, err
-	}
-	// page4KRound adjusts the file offset so data at origAddr is
-	// correct, but the VMA starts at the rounded address. Return
-	// origAddr so the guest sees the address it requested.
-	if origAddr != 0 && opts.Fixed && origAddr != rv {
-		return uintptr(origAddr), nil, nil
-	}
-	return uintptr(rv), nil, nil
+	return uintptr(rv), nil, err
 }
 
 // Munmap implements linux syscall munmap(2).
 func Munmap(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	addr := args[0].Pointer()
 	length := args[1].Uint64()
-	// In page4K mode, round inward to 16K boundaries to avoid
-	// unmapping adjacent memory that the caller didn't intend.
-	if mm.Page4KMode() && addr&0xFFF == 0 {
-		if addr&hostarch.Addr(hostarch.PageSize-1) != 0 {
-			// Round start UP to next 16K boundary.
-			newAddr := (addr + hostarch.Addr(hostarch.PageSize-1)) & ^hostarch.Addr(hostarch.PageSize-1)
-			delta := uint64(newAddr - addr)
-			if delta >= length {
-				return 0, nil, nil // sub-16K unmap, no-op
-			}
-			length -= delta
-			addr = newAddr
-		}
-		// Round length DOWN to 16K.
-		length = length & ^uint64(hostarch.PageSize-1)
-		if length == 0 {
-			return 0, nil, nil
-		}
-	}
 	return 0, nil, t.MemoryManager().MUnmap(t, addr, length)
 }
 
@@ -253,19 +191,6 @@ func Mprotect(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintpt
 		Read:    linux.PROT_READ&prot != 0,
 		Write:   linux.PROT_WRITE&prot != 0,
 		Execute: linux.PROT_EXEC&prot != 0,
-	}
-	// In page4K mode, round to 16K boundaries.
-	if mm.Page4KMode() && addr&0xFFF == 0 {
-		// Skip sub-16K PROT_NONE mprotects (guard pages).
-		if !perms.Any() && length < uint64(hostarch.PageSize) {
-			return 0, nil, nil
-		}
-		if addr&hostarch.Addr(hostarch.PageSize-1) != 0 {
-			addr, length, _ = page4KRound(addr, length, 0)
-		}
-		if length > 0 && length < uint64(hostarch.PageSize) {
-			length = uint64(hostarch.PageSize)
-		}
 	}
 	err := t.MemoryManager().MProtect(addr, length, perms, linux.PROT_GROWSDOWN&prot != 0)
 	return 0, nil, err
@@ -315,13 +240,13 @@ func Mincore(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr
 	vec := args[2].Pointer()
 
 	addr = hostarch.UntaggedUserAddr(addr)
-	if addr != addr.RoundDown() {
+	if addr != addr.GuestRoundDown() {
 		return 0, nil, linuxerr.EINVAL
 	}
 	// "The length argument need not be a multiple of the page size, but since
 	// residency information is returned for whole pages, length is effectively
 	// rounded up to the next multiple of the page size." - mincore(2)
-	la, ok := hostarch.Addr(length).RoundUp()
+	la, ok := hostarch.Addr(length).GuestRoundUp()
 	if !ok {
 		return 0, nil, linuxerr.ENOMEM
 	}
@@ -336,7 +261,7 @@ func Mincore(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr
 	if mapped != uint64(la) {
 		return 0, nil, linuxerr.ENOMEM
 	}
-	resident := bytes.Repeat([]byte{1}, int(mapped/hostarch.PageSize))
+	resident := bytes.Repeat([]byte{1}, int(mapped/hostarch.GuestPageSize))
 	_, err := t.CopyOutBytes(vec, resident)
 	return 0, nil, err
 }

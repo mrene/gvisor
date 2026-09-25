@@ -14,12 +14,15 @@
 
 #include "textflag.h"
 
+// On darwin, Rdtsc is implemented in tsc_darwin_arm64.go.
+#ifndef GOOS_darwin
 TEXT ·Rdtsc(SB),NOSPLIT,$0-8
 	// Get the virtual counter.
 	ISB	$15
 	WORD	$0xd53be040     //MRS	CNTVCT_EL0, R0
 	MOVD	R0, ret+0(FP)
 	RET
+#endif
 
 TEXT ·getCNTFRQ(SB),NOSPLIT,$0-8
 	// Get the virtual counter frequency.

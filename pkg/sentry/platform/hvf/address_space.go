@@ -43,6 +43,11 @@ type addressSpace struct {
 	mu      sync.Mutex
 	machine *machine
 	pt      *guestPageTable
+
+	// stale holds IPA references dropped from pt that are released by
+	// releaseStaleLocked. It is reused across calls to avoid allocation.
+	// Protected by mu.
+	stale []uint64
 }
 
 // hvfPageSize is the page size for HVF mappings on macOS ARM64.
@@ -67,31 +72,12 @@ func newAddressSpace(m *machine) (*addressSpace, error) {
 	}, nil
 }
 
-// sentryOwnedFile is a marker interface for memmap.File implementations
-// whose MapInternal host VAs are written to by the sentry and must
-// remain directly mapped (not shadow-copied) so that sentry writes
-// are immediately visible to the guest. pgalloc.MemoryFile implements
-// this interface.
-type sentryOwnedFile interface {
-	// IsSentryOwned is a marker method. If a memmap.File implements this,
-	// its host VAs are mapped directly into HVF without shadow-copying.
-	IsSentryOwned()
-}
-
 // MapFile implements platform.AddressSpace.MapFile.
 func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange,
 	at hostarch.AccessType, precommit bool) error {
 
 	as.mu.Lock()
 	defer as.mu.Unlock()
-
-	// Determine whether to shadow-copy this file's pages.
-	// MemoryFile pages are written by the sentry and must be mapped
-	// directly so writes are visible to the guest. File-backed pages
-	// (gofer file mmaps) must be shadow-copied because macOS can
-	// relocate their physical pages without updating HVF's stage-2.
-	_, sentryOwned := f.(sentryOwnedFile)
-	shadow := !sentryOwned
 
 	// Get the host virtual address mappings for this file region.
 	bs, err := f.MapInternal(fr, hostarch.AccessType{
@@ -103,9 +89,14 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 	}
 
 	// Map each block: assign IPA via allocator, then update page table.
+	// MemoryFile pages already have an IPA: see memFileMapper.
 	// Track mapped bytes for rollback on error (including partial blocks).
+	memFile := &as.machine.memFile
+	inMemFile := memFile.mf != nil && f == memmap.File(memFile.mf)
 	startAddr := addr
+	fileOff := fr.Start
 	var mappedBytes uint64
+	flush := false
 	for !bs.IsEmpty() {
 		b := bs.Head()
 		bs = bs.Tail()
@@ -113,37 +104,54 @@ func (as *addressSpace) MapFile(addr hostarch.Addr, f memmap.File, fr memmap.Fil
 		bLen := uintptr(b.Len())
 		gva := uintptr(addr)
 		srcAddr := uintptr(b.Addr())
-
 		pageSz := uintptr(hvfPageSize)
+
+		var memFileIPA uint64
+		if inMemFile {
+			memFileIPA, err = memFile.mapRange(memmap.FileRange{fileOff, fileOff + uint64(bLen)})
+			if err != nil {
+				as.unmapLocked(startAddr, mappedBytes)
+				return err
+			}
+			if at.Execute {
+				start := srcAddr &^ (pageSz - 1)
+				memFile.prepareExec(start, (srcAddr+bLen+pageSz-1)&^(pageSz-1)-start)
+			}
+		}
 		for off := uintptr(0); off < bLen; off += pageSz {
-			pageHost := (srcAddr + off) &^ (pageSz - 1)
 			pageGVA := (gva + off) &^ (pageSz - 1)
 
 			var ipa uint64
-			if shadow || at.Execute {
-				ipa, err = as.machine.ipaAlloc.mapPageShadow(pageHost, pageSz)
+			if inMemFile {
+				ipa = memFileIPA + uint64(off)
 			} else {
-				ipa, err = as.machine.ipaAlloc.mapPage(pageHost, pageSz)
-			}
-			if err != nil {
-				if mappedBytes > 0 {
+				ipa, err = as.machine.ipaAlloc.mapPage((srcAddr+off)&^(pageSz-1), pageSz)
+				if err != nil {
 					as.unmapLocked(startAddr, mappedBytes)
+					return err
 				}
-				return err
+				if at.Execute {
+					as.machine.ipaAlloc.prepareExec(ipa)
+				}
 			}
 
-			if err := as.pt.mapPage(uint64(pageGVA), ipa, at.Write); err != nil {
+			stale, staleFlush, err := as.pt.mapPage(uint64(pageGVA), ipa, at)
+			if err != nil {
 				as.machine.ipaAlloc.unmapIPA(ipa)
-				if mappedBytes > 0 {
-					as.unmapLocked(startAddr, mappedBytes)
-				}
+				as.unmapLocked(startAddr, mappedBytes)
 				return err
+			}
+			if stale != 0 {
+				as.stale = append(as.stale, stale)
+				flush = flush || staleFlush
 			}
 			mappedBytes += uint64(pageSz)
 		}
 
 		addr += hostarch.Addr(bLen)
+		fileOff += uint64(bLen)
 	}
+	as.releaseStaleLocked(flush)
 
 	return nil
 }
@@ -155,7 +163,8 @@ func (as *addressSpace) Unmap(addr hostarch.Addr, length uint64) {
 	as.unmapLocked(addr, length)
 }
 
-// unmapLocked clears PTEs and releases IPA mappings.
+// unmapLocked clears PTEs and releases IPA mappings, along with any
+// references pending in as.stale.
 // For large ranges (>1GB), uses the page table's internal structure
 // to skip unmapped regions instead of iterating every page.
 func (as *addressSpace) unmapLocked(addr hostarch.Addr, length uint64) {
@@ -163,15 +172,32 @@ func (as *addressSpace) unmapLocked(addr hostarch.Addr, length uint64) {
 	// For ranges larger than 1GB, iterate only mapped L3 entries
 	// to avoid O(n) iteration over sparse address spaces.
 	if length > 1<<30 {
-		as.pt.unmapRange(uint64(addr), end, as.machine.ipaAlloc)
-		return
-	}
-	for off := uint64(0); off < length; off += uint64(hvfPageSize) {
-		ipa := as.pt.unmapPage(uint64(addr) + off)
-		if ipa != 0 {
-			as.machine.ipaAlloc.unmapIPA(ipa)
+		as.stale = as.pt.unmapRange(uint64(addr), end, as.stale)
+	} else {
+		for off := uint64(0); off < length; off += uint64(hvfPageSize) {
+			if ipa := as.pt.unmapPage(uint64(addr) + off); ipa != 0 {
+				as.stale = append(as.stale, ipa)
+			}
 		}
 	}
+	as.releaseStaleLocked(true /* flush */)
+}
+
+// releaseStaleLocked releases the IPA references in as.stale. If flush is
+// set, vCPUs may hold translations from the cleared or replaced PTEs, and
+// they are flushed first: otherwise a thread still running on another vCPU
+// could access a page after it has been freed and reused.
+func (as *addressSpace) releaseStaleLocked(flush bool) {
+	if len(as.stale) == 0 {
+		return
+	}
+	if flush {
+		as.machine.flushTLB(as)
+	}
+	for _, ipa := range as.stale {
+		as.machine.ipaAlloc.unmapIPA(ipa)
+	}
+	as.stale = as.stale[:0]
 }
 
 // Release implements platform.AddressSpace.Release.

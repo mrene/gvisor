@@ -48,7 +48,7 @@ func (mm *MemoryManager) mapASLocked(ctx context.Context, pseg pmaIterator, ar h
 	}
 	// By default, map entire pmas at a time, under the assumption that there
 	// is no cost to mapping more of a pma than necessary.
-	mapAR := hostarch.AddrRange{0, ^hostarch.Addr(hostarch.PageSize - 1)}
+	mapAR := hostarch.AddrRange{0, ^hostarch.Addr(hostarch.GuestPageSize - 1)}
 	setMapUnit := func(mapUnit uint64) {
 		mapMask := hostarch.Addr(mapUnit - 1)
 		mapAR.Start = ar.Start &^ mapMask

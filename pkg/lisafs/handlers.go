@@ -1573,14 +1573,16 @@ func checkSafeName(name string) error {
 	return unix.EINVAL
 }
 
-// ExtractErrno extracts a unix.Errno from an error, best effort.
+// ExtractErrno extracts the Linux errno, which the protocol carries, from an
+// error, best effort.
 func ExtractErrno(err error) unix.Errno {
 	errno, _ := TryExtractErrno(err)
 	return errno
 }
 
-// TryExtractErrno extracts a unix.Errno from an error, and reports whether it
-// was successful. If unsuccessful, the returned errno is EIO.
+// TryExtractErrno extracts the Linux errno, which the protocol carries, from
+// an error, and reports whether it was successful. If unsuccessful, the
+// returned errno is EIO. Host errnos are translated.
 func TryExtractErrno(err error) (unix.Errno, bool) {
 	switch err {
 	case os.ErrNotExist:
@@ -1598,7 +1600,7 @@ func TryExtractErrno(err error) (unix.Errno, bool) {
 	case *errors.Error:
 		return linuxerr.ToUnix(e), true
 	case unix.Errno:
-		return e, true
+		return hostErrnoToLinux(e), true
 	case *os.PathError:
 		return TryExtractErrno(e.Err)
 	case *os.SyscallError:

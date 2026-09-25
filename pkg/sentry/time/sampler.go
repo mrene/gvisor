@@ -37,17 +37,6 @@ var errOverheadTooHigh = errors.New("time syscall overhead exceeds maximum")
 // TSCValue is a value from the TSC.
 type TSCValue int64
 
-// Rdtsc reads the TSC.
-//
-// Intel SDM, Vol 3, Ch 17.15:
-// "The RDTSC instruction reads the time-stamp counter and is guaranteed to
-// return a monotonically increasing unique value whenever executed, except for
-// a 64-bit counter wraparound. Intel guarantees that the time-stamp counter
-// will not wraparound within 10 years after being reset."
-//
-// We use int64, so we have 5 years before wrap-around.
-func Rdtsc() TSCValue
-
 // ReferenceNS are nanoseconds in the reference clock domain.
 // int64 gives us ~290 years before this overflows.
 type ReferenceNS int64

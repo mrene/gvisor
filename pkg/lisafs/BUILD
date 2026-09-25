@@ -118,6 +118,7 @@ go_library(
         "//pkg/p9",
         "//pkg/refs",
         "//pkg/sync",
+        "//pkg/syserr",
         "//pkg/unet",
         "@org_golang_x_sys//unix:go_default_library",
     ],
@@ -155,4 +156,16 @@ go_test(
     size = "small",
     srcs = ["node_test.go"],
     library = ":lisafs",
+)
+
+go_test(
+    name = "errno_test",
+    size = "small",
+    srcs = ["errno_test.go"],
+    library = ":lisafs",
+    deps = [
+        "//pkg/abi/linux/errno",
+        "//pkg/errors/linuxerr",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
 )

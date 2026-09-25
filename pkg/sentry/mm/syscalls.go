@@ -38,10 +38,18 @@ func (mm *MemoryManager) HandleUserFault(ctx context.Context, addr hostarch.Addr
 	if !ok {
 		return linuxerr.EFAULT
 	}
-
 	// Since we are only asking for a single page, there is no possibility
 	// of partial success, and any error is immediately fatal.
 	mm.mappingMu.RLock()
+	if hostarch.GuestPageSize < hostarch.PageSize {
+		// The host-page range may start in a different guest-page-aligned
+		// vma than addr. getPMAsLocked() only obtains pmas within the vma
+		// containing ar.Start, so without this the faulting page could be
+		// left unmapped or without copy-on-write broken, faulting forever.
+		if fseg := mm.vmas.FindSegment(addr); fseg.Ok() {
+			ar = ar.Intersect(fseg.Range())
+		}
+	}
 	vseg, _, err := mm.getVMAsLocked(ctx, ar, at, false)
 	if err != nil {
 		// When GuestPageSize < PageSize, the host-page range may cross
@@ -82,7 +90,7 @@ func (mm *MemoryManager) MMap(ctx context.Context, opts memmap.MMapOpts) (hostar
 	if opts.Length == 0 {
 		return 0, linuxerr.EINVAL
 	}
-	length, ok := hostarch.Addr(opts.Length).RoundUp()
+	length, ok := hostarch.Addr(opts.Length).GuestRoundUp()
 	if !ok {
 		return 0, linuxerr.ENOMEM
 	}
@@ -105,7 +113,7 @@ func (mm *MemoryManager) MMap(ctx context.Context, opts memmap.MMapOpts) (hostar
 		if opts.Fixed {
 			return 0, linuxerr.EINVAL
 		}
-		opts.Addr = opts.Addr.RoundDown()
+		opts.Addr = opts.Addr.GuestRoundDown()
 	}
 
 	if !opts.MaxPerms.SupersetOf(opts.Perms) {
@@ -267,7 +275,7 @@ func (mm *MemoryManager) MapStack(ctx context.Context) (hostarch.AddrRange, erro
 	const maxStackSize = 128 << 20
 
 	stackSize := limits.FromContext(ctx).Get(limits.Stack)
-	r, ok := hostarch.Addr(stackSize.Cur).RoundUp()
+	r, ok := hostarch.Addr(stackSize.Cur).GuestRoundUp()
 	sz := uint64(r)
 	if !ok {
 		// RLIM_INFINITY rounds up to 0.
@@ -283,7 +291,7 @@ func (mm *MemoryManager) MapStack(ctx context.Context) (hostarch.AddrRange, erro
 
 	// Determine the stack's desired location. Unlike Linux, address
 	// randomization can't be disabled.
-	stackEnd := mm.layout.MaxAddr - hostarch.Addr(rand.Int63n(int64(mm.layout.MaxStackRand))).RoundDown()
+	stackEnd := mm.layout.MaxAddr - hostarch.Addr(rand.Int63n(int64(mm.layout.MaxStackRand))).GuestRoundDown()
 	if stackEnd < szaddr {
 		return hostarch.AddrRange{}, linuxerr.ENOMEM
 	}
@@ -310,13 +318,13 @@ func (mm *MemoryManager) MapStack(ctx context.Context) (hostarch.AddrRange, erro
 // MUnmap implements the semantics of Linux's munmap(2).
 func (mm *MemoryManager) MUnmap(ctx context.Context, addr hostarch.Addr, length uint64) error {
 	addr = hostarch.UntaggedUserAddr(addr)
-	if addr != addr.RoundDown() {
+	if addr != addr.GuestRoundDown() {
 		return linuxerr.EINVAL
 	}
 	if length == 0 {
 		return linuxerr.EINVAL
 	}
-	la, ok := hostarch.Addr(length).RoundUp()
+	la, ok := hostarch.Addr(length).GuestRoundUp()
 	if !ok {
 		return linuxerr.EINVAL
 	}
@@ -367,15 +375,15 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 	oldAddr = hostarch.UntaggedUserAddr(oldAddr)
 
 	// "Note that old_address has to be page aligned." - mremap(2)
-	if oldAddr.RoundDown() != oldAddr {
+	if oldAddr.GuestRoundDown() != oldAddr {
 		return 0, linuxerr.EINVAL
 	}
 
 	// Linux treats an old_size that rounds up to 0 as 0, which is otherwise a
 	// valid size. However, new_size can't be 0 after rounding.
-	oldSizeAddr, _ := hostarch.Addr(oldSize).RoundUp()
+	oldSizeAddr, _ := hostarch.Addr(oldSize).GuestRoundUp()
 	oldSize = uint64(oldSizeAddr)
-	newSizeAddr, ok := hostarch.Addr(newSize).RoundUp()
+	newSizeAddr, ok := hostarch.Addr(newSize).GuestRoundUp()
 	if !ok || newSizeAddr == 0 {
 		return 0, linuxerr.EINVAL
 	}
@@ -499,7 +507,7 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 
 	case MRemapMustMove:
 		newAddr := opts.NewAddr
-		if newAddr.RoundDown() != newAddr {
+		if newAddr.GuestRoundDown() != newAddr {
 			return 0, linuxerr.EINVAL
 		}
 		var ok bool
@@ -634,15 +642,19 @@ func (mm *MemoryManager) MRemap(ctx context.Context, oldAddr hostarch.Addr, oldS
 }
 
 // MProtect implements the semantics of Linux's mprotect(2).
+//
+// The range only needs guest page alignment: with 4K guest pages on a 16K
+// host, rounding it to host pages would change the protection of adjacent
+// guest pages the application did not ask for.
 func (mm *MemoryManager) MProtect(addr hostarch.Addr, length uint64, realPerms hostarch.AccessType, growsDown bool) error {
 	addr = hostarch.UntaggedUserAddr(addr)
-	if addr.RoundDown() != addr {
+	if addr.GuestRoundDown() != addr {
 		return linuxerr.EINVAL
 	}
 	if length == 0 {
 		return nil
 	}
-	rlength, ok := hostarch.Addr(length).RoundUp()
+	rlength, ok := hostarch.Addr(length).GuestRoundUp()
 	if !ok {
 		return linuxerr.ENOMEM
 	}
@@ -776,8 +788,8 @@ func (mm *MemoryManager) Brk(ctx context.Context, addr hostarch.Addr) (hostarch.
 		return addr, linuxerr.ENOMEM
 	}
 
-	oldbrkpg, _ := mm.brk.End.RoundUp()
-	newbrkpg, ok := addr.RoundUp()
+	oldbrkpg, _ := mm.brk.End.GuestRoundUp()
+	newbrkpg, ok := addr.GuestRoundUp()
 	if !ok {
 		addr = mm.brk.End
 		mm.mappingMu.Unlock()
@@ -842,8 +854,8 @@ func (mm *MemoryManager) Brk(ctx context.Context, addr hostarch.Addr) (hostarch.
 func (mm *MemoryManager) MLock(ctx context.Context, addr hostarch.Addr, length uint64, mode memmap.MLockMode) error {
 	addr = hostarch.UntaggedUserAddr(addr)
 	// Linux allows this to overflow.
-	la, _ := hostarch.Addr(length + addr.PageOffset()).RoundUp()
-	ar, ok := addr.RoundDown().ToRange(uint64(la))
+	la, _ := hostarch.Addr(length + uint64(addr&hostarch.GuestPageMask)).GuestRoundUp()
+	ar, ok := addr.GuestRoundDown().ToRange(uint64(la))
 	if !ok {
 		return linuxerr.EINVAL
 	}
@@ -1043,11 +1055,11 @@ func (mm *MemoryManager) NumaPolicy(addr hostarch.Addr) (linux.NumaPolicy, uint6
 
 // SetNumaPolicy implements the semantics of Linux's mbind().
 func (mm *MemoryManager) SetNumaPolicy(addr hostarch.Addr, length uint64, policy linux.NumaPolicy, nodemask uint64) error {
-	if !addr.IsPageAligned() {
+	if !addr.IsGuestPageAligned() {
 		return linuxerr.EINVAL
 	}
 	// Linux allows this to overflow.
-	la, _ := hostarch.Addr(length).RoundUp()
+	la, _ := hostarch.Addr(length).GuestRoundUp()
 	ar, ok := addr.ToRange(uint64(la))
 	if !ok {
 		return linuxerr.EINVAL
@@ -1089,7 +1101,10 @@ func madviseAddrRange(addr hostarch.Addr, length uint64) (hostarch.AddrRange, er
 	// All quotes from the man page:
 	// "madvise() only operates on whole pages, therefore addr must be
 	// page-aligned."
-	if !addr.IsPageAligned() {
+	//
+	// Pages are guest pages: with 4K guest pages on a 16K host, rounding to
+	// host pages would extend MADV_DONTNEED over live neighboring memory.
+	if !addr.IsGuestPageAligned() {
 		// "EINVAL: addr is not page-aligned or length is negative." Note that
 		// length is size_t which is unsigned, so "length is negative" is
 		// impossible, but we take this as referring to the next check (for
@@ -1097,7 +1112,7 @@ func madviseAddrRange(addr hostarch.Addr, length uint64) (hostarch.AddrRange, er
 		return hostarch.AddrRange{}, linuxerr.EINVAL
 	}
 	// "The value of length is rounded up to a multiple of page size."
-	lengthRounded, ok := hostarch.PageRoundUp(length)
+	lengthRounded, ok := hostarch.GuestPageRoundUp(length)
 	if !ok {
 		return hostarch.AddrRange{}, linuxerr.EINVAL
 	}
@@ -1357,13 +1372,13 @@ type MSyncOpts struct {
 // MSync implements the semantics of Linux's msync().
 func (mm *MemoryManager) MSync(ctx context.Context, addr hostarch.Addr, length uint64, opts MSyncOpts) error {
 	addr = hostarch.UntaggedUserAddr(addr)
-	if addr != addr.RoundDown() {
+	if addr != addr.GuestRoundDown() {
 		return linuxerr.EINVAL
 	}
 	if length == 0 {
 		return nil
 	}
-	la, ok := hostarch.Addr(length).RoundUp()
+	la, ok := hostarch.Addr(length).GuestRoundUp()
 	if !ok {
 		return linuxerr.ENOMEM
 	}

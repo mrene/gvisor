@@ -359,22 +359,25 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 
 	// If we have a mmappable host FD (which must be used here to ensure
 	// coherence with memory-mapped I/O), or if InteropModeShared is in effect
-	// (which prevents us from caching file contents and makes dentry.size
-	// unreliable), or if the file was opened O_DIRECT, read directly from
-	// readHandle() without locking dentry.dataMu.
+	// without forcePageCache (which prevents us from caching file contents
+	// and makes dentry.size unreliable), or if the file was opened O_DIRECT,
+	// read directly from readHandle() without locking dentry.dataMu.
 	rw.d.inode.handleMu.RLock()
 	defer rw.d.inode.handleMu.RUnlock()
 	h := rw.d.inode.readHandle()
-	if (rw.d.inode.mmapFD.RacyLoad() >= 0 && !rw.d.inode.fs.opts.forcePageCache) || rw.d.inode.fs.opts.interop == InteropModeShared || rw.direct {
+	if rw.d.inode.bypassesCache() || rw.direct {
 		n, err := h.readToBlocksAt(rw.ctx, dsts, rw.off)
 		rw.off += n
 		return n, err
 	}
 
-	// Otherwise read from/through the cache.
+	// Otherwise read from/through the cache. Under InteropModeShared (with
+	// forcePageCache), only memory-mapped pages are cached, and reads must
+	// observe them; other ranges are read directly from the remote file, and
+	// the cache is not filled.
 	memCgID := pgalloc.MemoryCgroupIDFromContext(rw.ctx)
 	mf := rw.d.inode.fs.mf
-	fillCache := mf.ShouldCacheEvictable()
+	fillCache := rw.d.inode.fs.opts.interop != InteropModeShared && mf.ShouldCacheEvictable()
 	var dataMuUnlock func()
 	if fillCache {
 		rw.d.inode.dataMu.Lock()
@@ -382,6 +385,14 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 	} else {
 		rw.d.inode.dataMu.RLock()
 		dataMuUnlock = rw.d.inode.dataMu.RUnlock
+	}
+	if rw.d.inode.fs.opts.interop == InteropModeShared && rw.d.inode.cache.IsEmpty() {
+		// No pages are cached, so dentry.size may be stale; don't
+		// constrain the read to it.
+		dataMuUnlock()
+		n, err := h.readToBlocksAt(rw.ctx, dsts, rw.off)
+		rw.off += n
+		return n, err
 	}
 	defer dataMuUnlock()
 
@@ -473,13 +484,13 @@ func (rw *dentryReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, erro
 
 	// If we have a mmappable host FD (which must be used here to ensure
 	// coherence with memory-mapped I/O), or if InteropModeShared is in effect
-	// (which prevents us from caching file contents), or if the file was
-	// opened with O_DIRECT, write directly to dentry.writeHandle()
-	// without locking dentry.dataMu.
+	// without forcePageCache (which prevents us from caching file contents),
+	// or if the file was opened with O_DIRECT, write directly to
+	// dentry.writeHandle() without locking dentry.dataMu.
 	rw.d.inode.handleMu.RLock()
 	defer rw.d.inode.handleMu.RUnlock()
 	h := rw.d.inode.writeHandle()
-	if (rw.d.inode.mmapFD.RacyLoad() >= 0 && !rw.d.inode.fs.opts.forcePageCache) || rw.d.inode.fs.opts.interop == InteropModeShared || rw.direct {
+	if rw.d.inode.bypassesCache() || rw.direct {
 		n, err := h.writeFromBlocksAt(rw.ctx, srcs, rw.off)
 		rw.off += n
 		rw.d.inode.dataMu.Lock()
@@ -492,7 +503,8 @@ func (rw *dentryReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64, erro
 		return n, err
 	}
 
-	// Otherwise write to/through the cache.
+	// Otherwise write to/through the cache. Uncached ranges are written
+	// directly to the remote file.
 	mf := rw.d.inode.fs.mf
 	rw.d.inode.dataMu.Lock()
 	defer rw.d.inode.dataMu.Unlock()
@@ -562,9 +574,9 @@ exitLoop:
 		// The remote file's size will implicitly be extended to the correct
 		// value when we write back to it.
 	}
-	// If InteropModeWritethrough is in effect, flush written data back to the
-	// remote filesystem.
-	if rw.d.inode.fs.opts.interop == InteropModeWritethrough && done != 0 {
+	// If InteropModeWritethrough or InteropModeShared is in effect, flush
+	// written data back to the remote filesystem.
+	if interop := rw.d.inode.fs.opts.interop; (interop == InteropModeWritethrough || interop == InteropModeShared) && done != 0 {
 		if err := fsutil.SyncDirty(rw.ctx, memmap.MappableRange{
 			Start: start,
 			End:   rw.off,
@@ -693,6 +705,12 @@ func (fs *filesystem) mayCachePagesInMemoryFile() bool {
 	return fs.opts.forcePageCache || fs.opts.interop != InteropModeShared
 }
 
+// bypassesCache returns true if reads and writes of i's data must go directly
+// to the remote file rather than through i.cache.
+func (i *inode) bypassesCache() bool {
+	return !i.fs.opts.forcePageCache && (i.mmapFD.RacyLoad() >= 0 || i.fs.opts.interop == InteropModeShared)
+}
+
 // AddMapping implements memmap.Mappable.AddMapping.
 func (d *dentry) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
 	// Do this unconditionally since whether we have a host FD can change
@@ -718,18 +736,65 @@ func (d *dentry) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar h
 	d.inode.mapsMu.Lock()
 	defer d.inode.mapsMu.Unlock()
 	unmapped := d.inode.mappings.RemoveMapping(ms, ar, offset, writable)
-	if d.inode.fs.mayCachePagesInMemoryFile() {
-		// Pages that are no longer referenced by any application memory
-		// mappings are now considered unused; allow MemoryFile to evict them
-		// when necessary.
-		mf := d.inode.fs.mf
-		d.inode.dataMu.Lock()
-		defer d.inode.dataMu.Unlock()
-		for _, r := range unmapped {
-			// Since these pages are no longer mapped, they are no longer
-			// concurrently dirtyable by a writable memory mapping.
-			d.inode.dirty.AllowClean(r)
-			mf.MarkEvictable(d.inode, pgalloc.EvictableRange{Start: r.Start, End: r.End})
+	if !d.inode.fs.mayCachePagesInMemoryFile() {
+		return
+	}
+	// Under InteropModeShared (with forcePageCache), pages are cached only
+	// while they are memory-mapped, since cached pages are not revalidated
+	// against the remote file.
+	shared := d.inode.fs.opts.interop == InteropModeShared
+	if shared {
+		d.inode.handleMu.RLock()
+		defer d.inode.handleMu.RUnlock()
+	}
+	// Pages that are no longer referenced by any application memory
+	// mappings are now considered unused; allow MemoryFile to evict them
+	// when necessary.
+	mf := d.inode.fs.mf
+	d.inode.dataMu.Lock()
+	defer d.inode.dataMu.Unlock()
+	for _, r := range unmapped {
+		// Since these pages are no longer mapped, they are no longer
+		// concurrently dirtyable by a writable memory mapping.
+		d.inode.dirty.AllowClean(r)
+		mf.MarkEvictable(d.inode, pgalloc.EvictableRange{Start: r.Start, End: r.End})
+	}
+	if shared {
+		d.inode.releaseUnmappedPagesLocked(ctx, unmapped)
+	}
+}
+
+// releaseUnmappedPagesLocked writes back dirty pages in unmapped, so that
+// stores through memory mappings reach the remote file, and drops the cached
+// pages that are no longer mapped, so that later reads and mappings observe
+// the remote file.
+//
+// Preconditions: i.mapsMu must be locked. i.handleMu must be locked for
+// reading. i.dataMu must be locked.
+func (i *inode) releaseUnmappedPagesLocked(ctx context.Context, unmapped []memmap.MappableRange) {
+	mf := i.fs.mf
+	h := i.writeHandle()
+	for _, r := range unmapped {
+		// Cached pages are host-page-aligned (see fsutil.FileRangeSet.Fill),
+		// so drop only host pages that are no longer mapped at all.
+		r.Start = hostarch.PageRoundDown(r.Start)
+		if end, ok := hostarch.PageRoundUp(r.End); ok {
+			r.End = end
+		}
+		if err := fsutil.SyncDirty(ctx, r, &i.cache, &i.dirty, i.size.Load(), mf, h.writeFromBlocksAt); err != nil {
+			log.Warningf("gofer.inode.releaseUnmappedPagesLocked: failed to write back %v: %v", r, err)
+			continue
+		}
+		for mgap := i.mappings.LowerBoundGap(r.Start); mgap.Ok() && mgap.Start() < r.End; mgap = mgap.NextGap() {
+			gr := mgap.Range().Intersect(r)
+			start, ok := hostarch.PageRoundUp(gr.Start)
+			if !ok {
+				continue
+			}
+			end := hostarch.PageRoundDown(gr.End)
+			if start < end {
+				i.cache.Drop(memmap.MappableRange{Start: start, End: end}, mf)
+			}
 		}
 	}
 }

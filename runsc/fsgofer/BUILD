@@ -41,3 +41,16 @@ go_test(
         "//pkg/log",
     ],
 )
+
+go_test(
+    name = "open_mode_test",
+    size = "small",
+    srcs = ["open_mode_test.go"],
+    deps = [
+        ":fsgofer",
+        "//pkg/context",
+        "//pkg/lisafs",
+        "//pkg/unet",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)

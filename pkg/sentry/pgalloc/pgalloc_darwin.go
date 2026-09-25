@@ -18,35 +18,12 @@
 package pgalloc
 
 import (
-	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 
-	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/safemem"
 )
-
-// UseMachMemory controls whether MemoryFile chunks are backed by Mach
-// anonymous memory entries instead of file-backed MAP_SHARED mmap.
-//
-// When enabled, mmapChunks uses mach_make_memory_entry_64 with
-// MAP_MEM_NAMED_CREATE to create anonymous VM objects. These pages
-// should have stable physical addresses because they aren't subject
-// to file-cache eviction/reload, potentially fixing the sequential
-// exec crash where macOS silently relocates physical pages.
-//
-// EXPERIMENTAL: Set to 1 via SetUseMachMemory before MemoryFile init.
-var useMachMemory atomic.Int32
-
-// SetUseMachMemory enables or disables Mach anonymous memory backing.
-func SetUseMachMemory(enabled bool) {
-	if enabled {
-		useMachMemory.Store(1)
-	} else {
-		useMachMemory.Store(0)
-	}
-}
 
 // madviseHugepage is a no-op on darwin (no huge page madvise).
 func madviseHugepage(addr, length uintptr) {}
@@ -84,34 +61,11 @@ func fallocateDecommit(fd int, off, length int64) error {
 	return nil
 }
 
-// mmapChunks maps MemoryFile chunks.
-//
-// When useMachMemory is enabled, chunks are backed by Mach anonymous
-// memory entries (mach_make_memory_entry_64) instead of file-backed
-// MAP_SHARED. This is an experimental fix for the sequential exec
-// crash where macOS silently relocates physical pages backing
-// file-mapped memory without notifying HVF's stage-2 tables.
-//
-// When disabled (default), uses MAP_SHARED for file-backed mapping.
+// mmapChunks maps MemoryFile chunks with MAP_SHARED. HVF's stage-2
+// translation follows this mapping (the file's VM object), so pages the guest
+// maps stay coherent with the sentry's view across host paging and hole
+// punching.
 func mmapChunks(fd uintptr, size, offset uintptr) (uintptr, error) {
-	if useMachMemory.Load() != 0 {
-		ptr, err := MachAllocAnonymous(size)
-		if err != nil {
-			log.Warningf("MachAllocAnonymous(%d) failed, falling back to MAP_SHARED: %v", size, err)
-		} else {
-			addr := uintptr(ptr)
-			// Copy existing file content into the anonymous mapping
-			// so that pages allocated before this chunk still work.
-			if offset > 0 || size > 0 {
-				// Read file content into the anonymous memory.
-				buf := unsafe.Slice((*byte)(unsafe.Pointer(addr)), size)
-				unix.Pread(int(fd), buf, int64(offset))
-			}
-			return addr, nil
-		}
-	}
-
-	// Default: file-backed MAP_SHARED.
 	m, _, errno := unix.Syscall6(
 		unix.SYS_MMAP,
 		0, size,
@@ -122,9 +76,3 @@ func mmapChunks(fd uintptr, size, offset uintptr) (uintptr, error) {
 	}
 	return m, nil
 }
-
-// IsSentryOwned marks MemoryFile as sentry-owned memory. The HVF platform
-// uses this to distinguish MemoryFile pages (which the sentry writes to
-// directly) from file-backed pages (which must be shadow-copied to prevent
-// macOS from relocating their physical backing).
-func (f *MemoryFile) IsSentryOwned() {}

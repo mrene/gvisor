@@ -17,10 +17,14 @@
 package pgalloc
 
 import (
+	"bytes"
+	"os"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/usage"
 )
 
 const (
@@ -583,5 +587,51 @@ func TestFindAllocatable(t *testing.T) {
 				t.Errorf("findAllocatableAndMarkUsed(%+v): got: end=%#x, want: %#x\n%v", alloc, fr.End, wantEnd, f)
 			}
 		})
+	}
+}
+
+// TestAllocateFillGuestPages checks that allocations filled by a ReaderFunc
+// keep every filled guest page, including when the length is not a multiple
+// of the host page size.
+func TestAllocateFillGuestPages(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "memfile")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	mf, err := NewMemoryFile(file, MemoryFileOpts{
+		DisableIMAWorkAround:    true,
+		DisableMemoryAccounting: true,
+	})
+	if err != nil {
+		t.Fatalf("NewMemoryFile: %v", err)
+	}
+	defer mf.Destroy()
+
+	for _, pages := range []uint64{1, 3, 5} {
+		length := pages * hostarch.GuestPageSize
+		want := bytes.Repeat([]byte{0xa5}, int(length))
+		fr, err := mf.Allocate(length, AllocOpts{
+			Kind:       usage.Anonymous,
+			Mode:       AllocateAndWritePopulate,
+			ReaderFunc: safemem.FromIOReader{Reader: bytes.NewReader(want)}.ReadToBlocks,
+		})
+		if err != nil {
+			t.Fatalf("Allocate(%#x): %v", length, err)
+		}
+		if fr.Length() < length {
+			t.Fatalf("Allocate(%#x) = %v, want at least %#x bytes", length, fr, length)
+		}
+		bs, err := mf.MapInternal(memmap.FileRange{Start: fr.Start, End: fr.Start + length}, hostarch.Read)
+		if err != nil {
+			t.Fatalf("MapInternal(%v): %v", fr, err)
+		}
+		got := make([]byte, length)
+		if _, err := safemem.CopySeq(safemem.BlockSeqOf(safemem.BlockFromSafeSlice(got)), bs); err != nil {
+			t.Fatalf("CopySeq: %v", err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("Allocate(%#x) contents do not match the filled data", length)
+		}
+		mf.DecRef(fr)
 	}
 }

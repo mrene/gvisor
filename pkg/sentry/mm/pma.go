@@ -120,24 +120,13 @@ func (mm *MemoryManager) getPMAsLocked(ctx context.Context, vseg vmaIterator, ar
 	}
 
 	// Page-align ar so that all AddrRanges are aligned.
-	end, ok := ar.End.RoundUp()
+	end, ok := ar.End.GuestRoundUp()
 	var alignerr error
 	if !ok {
-		end = ar.End.RoundDown()
+		end = ar.End.GuestRoundDown()
 		alignerr = linuxerr.EFAULT
 	}
-	start := ar.Start.RoundDown()
-	// When GuestPageSize < PageSize, RoundDown may extend start
-	// before the VMA. Clamp to VMA boundaries.
-	if hostarch.GuestPageSize < hostarch.PageSize {
-		if start < vseg.Start() {
-			start = vseg.Start()
-		}
-		if end > vseg.End() {
-			end = vseg.End()
-		}
-	}
-	ar = hostarch.AddrRange{start, end}
+	ar = hostarch.AddrRange{ar.Start.GuestRoundDown(), end}
 	if ar.Length() == 0 {
 		return pmaIterator{}, mm.pmas.LowerBoundGap(ar.Start), alignerr
 	}
@@ -180,13 +169,13 @@ func (mm *MemoryManager) getVecPMAsLocked(ctx context.Context, ars hostarch.Addr
 		}
 
 		// Page-align ar so that all AddrRanges are aligned.
-		end, ok := ar.End.RoundUp()
+		end, ok := ar.End.GuestRoundUp()
 		var alignerr error
 		if !ok {
-			end = ar.End.RoundDown()
+			end = ar.End.GuestRoundDown()
 			alignerr = linuxerr.EFAULT
 		}
-		ar = hostarch.AddrRange{ar.Start.RoundDown(), end}
+		ar = hostarch.AddrRange{ar.Start.GuestRoundDown(), end}
 
 		_, pend, perr := mm.getPMAsInternalLocked(ctx, mm.vmas.FindSegment(ar.Start), ar, at, callerIndirectCommit)
 		if perr != nil {
@@ -241,7 +230,7 @@ func (mm *MemoryManager) getAllocationDirection(ar hostarch.AddrRange, vma *vma)
 //     getVecPMAsLocked; other clients should call one of those instead.
 func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIterator, ar hostarch.AddrRange, at hostarch.AccessType, callerIndirectCommit bool) (pmaIterator, pmaGapIterator, error) {
 	if checkInvariants {
-		if !ar.WellFormed() || ar.Length() == 0 || !ar.IsPageAligned() {
+		if !ar.WellFormed() || ar.Length() == 0 || !ar.IsGuestPageAligned() {
 			panic(fmt.Sprintf("invalid ar: %v", ar))
 		}
 		if !vseg.Ok() {
@@ -676,7 +665,7 @@ func (mm *MemoryManager) isPMACopyOnWriteLocked(vseg vmaIterator, pseg pmaIterat
 // Invalidate implements memmap.MappingSpace.Invalidate.
 func (mm *MemoryManager) Invalidate(ar hostarch.AddrRange, opts memmap.InvalidateOpts) {
 	if checkInvariants {
-		if !ar.WellFormed() || ar.Length() == 0 || !ar.IsPageAligned() {
+		if !ar.WellFormed() || ar.Length() == 0 || !ar.IsGuestPageAligned() {
 			panic(fmt.Sprintf("invalid ar: %v", ar))
 		}
 	}
@@ -699,7 +688,7 @@ func (mm *MemoryManager) Invalidate(ar hostarch.AddrRange, opts memmap.Invalidat
 //   - ar must be page-aligned.
 func (mm *MemoryManager) invalidateLocked(ar hostarch.AddrRange, invalidatePrivate, invalidateShared bool) {
 	if checkInvariants {
-		if !ar.WellFormed() || ar.Length() == 0 || !ar.IsPageAligned() {
+		if !ar.WellFormed() || ar.Length() == 0 || !ar.IsGuestPageAligned() {
 			panic(fmt.Sprintf("invalid ar: %v", ar))
 		}
 	}
@@ -762,7 +751,7 @@ func (mm *MemoryManager) invalidateLocked(ar hostarch.AddrRange, invalidatePriva
 //   - ar must be page-aligned.
 func (mm *MemoryManager) Pin(ctx context.Context, ar hostarch.AddrRange, at hostarch.AccessType, ignorePermissions bool) ([]PinnedRange, error) {
 	if checkInvariants {
-		if !ar.WellFormed() || ar.Length() == 0 || !ar.IsPageAligned() {
+		if !ar.WellFormed() || ar.Length() == 0 || !ar.IsGuestPageAligned() {
 			panic(fmt.Sprintf("invalid ar: %v", ar))
 		}
 	}
@@ -849,10 +838,10 @@ func Unpin(prs []PinnedRange) {
 //   - oldAR and newAR must be page-aligned.
 func (mm *MemoryManager) movePMAsLocked(oldAR, newAR hostarch.AddrRange) {
 	if checkInvariants {
-		if !oldAR.WellFormed() || oldAR.Length() == 0 || !oldAR.IsPageAligned() {
+		if !oldAR.WellFormed() || oldAR.Length() == 0 || !oldAR.IsGuestPageAligned() {
 			panic(fmt.Sprintf("invalid oldAR: %v", oldAR))
 		}
-		if !newAR.WellFormed() || newAR.Length() == 0 || !newAR.IsPageAligned() {
+		if !newAR.WellFormed() || newAR.Length() == 0 || !newAR.IsGuestPageAligned() {
 			panic(fmt.Sprintf("invalid newAR: %v", newAR))
 		}
 		if oldAR.Length() > newAR.Length() {

@@ -14,7 +14,11 @@
 
 package lisafs
 
-import "golang.org/x/sys/unix"
+import (
+	"fmt"
+
+	"golang.org/x/sys/unix"
+)
 
 // STATX constants used by the lisafs protocol. On Linux these come from
 // golang.org/x/sys/unix.
@@ -31,11 +35,27 @@ const (
 // EREMOTEIO.
 const errREMOTEIO = unix.EREMOTEIO
 
-// pollRDHUP is the poll event for detecting remote hangup. On Linux this is
-// POLLRDHUP.
-const pollRDHUP = unix.POLLRDHUP
+// hostErrnoToLinux returns the Linux errno, which the protocol carries, for
+// host errno e. On Linux they are the same.
+func hostErrnoToLinux(e unix.Errno) unix.Errno {
+	return e
+}
 
-// ppoll wraps the ppoll(2) syscall.
-func ppoll(fds []unix.PollFd, timeout *unix.Timespec, sigmask *unix.Sigset_t) (int, error) {
-	return unix.Ppoll(fds, timeout, sigmask)
+// waitHangup blocks until the socket fd is shut down locally or its peer
+// hangs up.
+func waitHangup(fd int) error {
+	events := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLHUP | unix.POLLRDHUP}}
+	for {
+		n, err := unix.Ppoll(events, nil, nil)
+		if err == unix.EINTR || err == unix.EAGAIN {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return fmt.Errorf("got %d events, wanted 1", n)
+		}
+		return nil
+	}
 }

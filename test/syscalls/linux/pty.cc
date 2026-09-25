@@ -268,6 +268,28 @@ TEST(BasicPtyTest, OpenMasterReplica) {
   FileDescriptor replica = ASSERT_NO_ERRNO_AND_VALUE(OpenReplica(master));
 }
 
+// Before a replica has been opened, reading the master blocks rather than
+// failing: programs such as Nix open the master, fork a child that opens the
+// replica, and immediately wait for the child's output.
+TEST(BasicPtyTest, MasterReadBeforeReplicaOpen) {
+  FileDescriptor master =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/dev/ptmx", O_RDWR | O_NONBLOCK));
+  ASSERT_THAT(unlockpt(master.get()), SyscallSucceeds());
+
+  char c;
+  EXPECT_THAT(ReadFd(master.get(), &c, 1), SyscallFailsWithErrno(EAGAIN));
+  struct pollfd pfd = {.fd = master.get(), .events = POLLIN};
+  ASSERT_THAT(poll(&pfd, 1, 0), SyscallSucceeds());
+  EXPECT_EQ(pfd.revents & (POLLIN | POLLHUP), 0);
+
+  // Once the only replica is closed, the master reports EIO and HUP.
+  FileDescriptor replica = ASSERT_NO_ERRNO_AND_VALUE(OpenReplica(master));
+  replica.reset();
+  EXPECT_THAT(ReadFd(master.get(), &c, 1), SyscallFailsWithErrno(EIO));
+  ASSERT_THAT(poll(&pfd, 1, 0), SyscallSucceedsWithValue(1));
+  EXPECT_NE(pfd.revents & POLLHUP, 0);
+}
+
 TEST(BasicPtyTest, OpenSetsControllingTTY) {
   // setsid either puts us in a new session or fails because we're already the
   // session leader. Either way, this ensures we're the session leader.

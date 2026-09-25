@@ -29,3 +29,10 @@ const mapFixedNoreplace = unix.MAP_FIXED
 // (com.apple.provenance/quarantine). MAP_PRIVATE creates copy-on-write
 // pages that HVF accepts and can map directly into the guest VM.
 const mmapSharedFlag = unix.MAP_PRIVATE
+
+// mapChunksWritable is true on macOS: MmapCachedFile chunks are MAP_PRIVATE
+// there, so writes through them never reach the file, and mapping every chunk
+// writable from the start means that a chunk's mapping is never replaced to
+// make it writable. HVF maps chunk pages into the guest by host address and
+// would keep using the pages of a replaced mapping.
+const mapChunksWritable = true

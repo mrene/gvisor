@@ -516,10 +516,11 @@ func (mm *MemoryManager) LoadUint32(ctx context.Context, addr hostarch.Addr, opt
 //   - ioar.Length() != 0.
 //   - ioar.Contains(addr).
 func (mm *MemoryManager) handleASIOFault(ctx context.Context, addr hostarch.Addr, ioar hostarch.AddrRange, at hostarch.AccessType) error {
-	// Try to map all remaining pages in the I/O operation. This RoundUp can't
-	// overflow because otherwise it would have been caught by CheckIORange.
-	end, _ := ioar.End.RoundUp()
-	ar := hostarch.AddrRange{addr.RoundDown(), end}
+	// Try to map all remaining pages in the I/O operation. This GuestRoundUp
+	// can't overflow because otherwise it would have been caught by
+	// CheckIORange.
+	end, _ := ioar.End.GuestRoundUp()
+	ar := hostarch.AddrRange{addr.GuestRoundDown(), end}
 
 	// Don't bother trying existingPMAsLocked; in most cases, if we did have
 	// existing pmas, we wouldn't have faulted.

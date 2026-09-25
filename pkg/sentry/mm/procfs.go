@@ -205,8 +205,8 @@ func (mm *MemoryManager) vmaSmapsEntryIntoLocked(ctx context.Context, vseg vmaIt
 	// Swap is not implemented.
 	fmt.Fprintf(b, "Swap:           %8d kB\n", 0)
 	fmt.Fprintf(b, "SwapPss:        %8d kB\n", 0)
-	fmt.Fprintf(b, "KernelPageSize: %8d kB\n", hostarch.PageSize/1024)
-	fmt.Fprintf(b, "MMUPageSize:    %8d kB\n", hostarch.PageSize/1024)
+	fmt.Fprintf(b, "KernelPageSize: %8d kB\n", hostarch.GuestPageSize/1024)
+	fmt.Fprintf(b, "MMUPageSize:    %8d kB\n", hostarch.GuestPageSize/1024)
 	locked := rss
 	if vma.mlockMode == memmap.MLockNone {
 		locked = 0

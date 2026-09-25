@@ -132,13 +132,13 @@ func CheckTranslateResult(required, optional MappableRange, at hostarch.AccessTy
 	if !required.WellFormed() || required.Length() == 0 {
 		panic(fmt.Sprintf("invalid required range: %v", required))
 	}
-	if !hostarch.Addr(required.Start).IsPageAligned() || !hostarch.Addr(required.End).IsPageAligned() {
+	if !hostarch.Addr(required.Start).IsGuestPageAligned() || !hostarch.Addr(required.End).IsGuestPageAligned() {
 		panic(fmt.Sprintf("unaligned required range: %v", required))
 	}
 	if !optional.IsSupersetOf(required) {
 		panic(fmt.Sprintf("optional range %v is not a superset of required range %v", optional, required))
 	}
-	if !hostarch.Addr(optional.Start).IsPageAligned() || !hostarch.Addr(optional.End).IsPageAligned() {
+	if !hostarch.Addr(optional.Start).IsGuestPageAligned() || !hostarch.Addr(optional.End).IsGuestPageAligned() {
 		panic(fmt.Sprintf("unaligned optional range: %v", optional))
 	}
 
@@ -150,13 +150,13 @@ func CheckTranslateResult(required, optional MappableRange, at hostarch.AccessTy
 		if !t.Source.WellFormed() || t.Source.Length() == 0 {
 			return fmt.Errorf("Translation %+v has invalid Source", t)
 		}
-		if !hostarch.Addr(t.Source.Start).IsPageAligned() || !hostarch.Addr(t.Source.End).IsPageAligned() {
+		if !hostarch.Addr(t.Source.Start).IsGuestPageAligned() || !hostarch.Addr(t.Source.End).IsGuestPageAligned() {
 			return fmt.Errorf("Translation %+v has unaligned Source", t)
 		}
 		if t.File == nil {
 			return fmt.Errorf("Translation %+v has nil File", t)
 		}
-		if !hostarch.Addr(t.Offset).IsPageAligned() {
+		if !hostarch.Addr(t.Offset).IsGuestPageAligned() {
 			return fmt.Errorf("Translation %+v has unaligned Offset", t)
 		}
 		// Translations must be contiguous and in increasing order of

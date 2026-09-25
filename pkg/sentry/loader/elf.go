@@ -41,7 +41,7 @@ const (
 
 	// maxTotalPhdrSize is the maximum combined size of all program
 	// headers.  Linux limits this to one page.
-	maxTotalPhdrSize = hostarch.PageSize
+	maxTotalPhdrSize = hostarch.GuestPageSize
 )
 
 var (
@@ -233,8 +233,9 @@ func parseHeader(ctx context.Context, f fullReader) (elfInfo, error) {
 // mapSegment maps a phdr into the Task. offset is the offset to apply to
 // phdr.Vaddr.
 func mapSegment(ctx context.Context, m *mm.MemoryManager, fd *vfs.FileDescription, phdr *elf.ProgHeader, offset hostarch.Addr) error {
-	// We must make a page-aligned mapping.
-	adjust := hostarch.Addr(phdr.Vaddr).PageOffset()
+	// ELF segments are aligned to the application-visible guest page size,
+	// which may be smaller than the host page size.
+	adjust := uint64(phdr.Vaddr) & hostarch.GuestPageMask
 
 	addr, ok := offset.AddLength(phdr.Vaddr)
 	if !ok {
@@ -249,12 +250,37 @@ func mapSegment(ctx context.Context, m *mm.MemoryManager, fd *vfs.FileDescriptio
 		ctx.Infof("Computed segment file size overflows: %#x + %#x", phdr.Filesz, adjust)
 		return linuxerr.ENOEXEC
 	}
-	ms, ok := hostarch.Addr(fileSize).RoundUp()
+	memSize := phdr.Memsz + adjust
+	if memSize < phdr.Memsz {
+		ctx.Infof("Computed segment mem size overflows: %#x + %#x", phdr.Memsz, adjust)
+		return linuxerr.ENOEXEC
+	}
+	ms, ok := hostarch.GuestPageRoundUp(hostarch.Addr(fileSize))
 	if !ok {
 		ctx.Infof("fileSize %#x too large", fileSize)
 		return linuxerr.ENOEXEC
 	}
 	mapSize := uint64(ms)
+
+	// Some ARM64 dynamic linkers protect PT_GNU_RELRO at the host page
+	// boundary advertised by their ABI. Keep the prefix between that boundary
+	// and the first guest page mapped so that mprotect covers a contiguous
+	// range, while mapping the segment contents at their guest-page-correct
+	// address below.
+	if hostStart := addr.RoundDown(); hostStart < addr {
+		if _, err := m.MMap(ctx, memmap.MMapOpts{
+			Length:   uint64(addr - hostStart),
+			Addr:     hostStart,
+			Fixed:    true,
+			Unmap:    true,
+			Private:  true,
+			Perms:    progFlagsAsPerms(phdr.Flags),
+			MaxPerms: hostarch.AnyAccess,
+		}); err != nil {
+			ctx.Infof("Error mapping PT_LOAD segment prefix at %#x: %v", hostStart, err)
+			return err
+		}
+	}
 
 	if mapSize > 0 {
 		// This must result in a page-aligned offset. i.e., the original
@@ -314,19 +340,13 @@ func mapSegment(ctx context.Context, m *mm.MemoryManager, fd *vfs.FileDescriptio
 		}
 	}
 
-	memSize := phdr.Memsz + adjust
-	if memSize < phdr.Memsz {
-		ctx.Infof("Computed segment mem size overflows: %#x + %#x", phdr.Memsz, adjust)
-		return linuxerr.ENOEXEC
-	}
-
 	// Allocate more anonymous pages if necessary.
 	if mapSize < memSize {
 		anonAddr, ok := addr.AddLength(mapSize)
 		if !ok {
 			panic(fmt.Sprintf("anonymous memory doesn't fit in pre-sized range? %#x + %#x", addr, mapSize))
 		}
-		anonSize, ok := hostarch.Addr(memSize - mapSize).RoundUp()
+		anonSize, ok := hostarch.GuestPageRoundUp(hostarch.Addr(memSize - mapSize))
 		if !ok {
 			ctx.Infof("extra anon pages too large: %#x", memSize-mapSize)
 			return linuxerr.ENOEXEC
@@ -491,7 +511,7 @@ func loadParsedELF(ctx context.Context, m *mm.MemoryManager, fd *vfs.FileDescrip
 	var offset hostarch.Addr
 	if info.sharedObject {
 		totalSize := end - start
-		totalSize, ok := totalSize.RoundUp()
+		totalSize, ok := hostarch.GuestPageRoundUp(totalSize)
 		if !ok {
 			ctx.Infof("ELF PT_LOAD segments too big")
 			return loadedELF{}, linuxerr.ENOEXEC

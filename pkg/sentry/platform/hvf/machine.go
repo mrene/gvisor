@@ -26,6 +26,7 @@ import "C"
 import (
 	"fmt"
 	"runtime"
+	"sync/atomic"
 	"unsafe"
 
 	"gvisor.dev/gvisor/pkg/hosttid"
@@ -41,6 +42,10 @@ import (
 // Each vCPU gets one 16K page: statePageVABase + id * 16K.
 const statePageVABase = kernelVABase + 0x4000
 
+// maxThreadVCPUs bounds the per-thread vCPU pool. State pages for this many
+// vCPUs fit below the dispatch page at kernelVABase + 2MB.
+const maxThreadVCPUs = 64
+
 type vCPU struct {
 	id          int
 	vcpuID      C.hv_vcpu_t       // HVF vCPU handle
@@ -49,13 +54,25 @@ type vCPU struct {
 	machine     *machine          // Parent machine (shared resources)
 	asidCounter    uint64 // Incrementing ASID for TLB invalidation
 	asidWrapped    bool   // True when ASID just wrapped (need full TLBI)
-	fpLoaded      bool // FP regs loaded at least once
+	// fpOwner is the context whose FP/SIMD state is in the vCPU's
+	// registers, or nil. Only accessed by the vCPU's thread.
+	fpOwner       *hvfContext
 	saveFP        bool // Save FP on next saveRegisters call
 	gpInStatePage bool // True when GP regs were saved to state page by EL1 handler
+	// gpInVectorScratch is true when the exit came through el0_sync, which
+	// stashed guest X16-X18 in its scratch system registers.
+	gpInVectorScratch bool
 
 	// Per-vCPU state page for in-VM register save/restore.
 	statePageHost unsafe.Pointer // host VA (for direct read/write)
 	statePageVA   uint64         // kernel VA in TTBR1 (for EL1 access)
+
+	// running is the address space this vCPU last entered the guest with.
+	// runGen is odd while the vCPU is inside hv_vcpu_run and changes on
+	// every entry and exit. Both are written by the owning thread and read
+	// by machine.flushTLB.
+	running atomic.Pointer[addressSpace]
+	runGen  atomic.Uint64
 }
 
 // NotifyInterrupt implements interrupt.Receiver.NotifyInterrupt.
@@ -72,12 +89,22 @@ func (c *vCPU) NotifyInterrupt() {
 // that created it. The machine creates vCPUs lazily per-thread and
 // caches them for reuse.
 type machine struct {
-	mu       sync.Mutex
-	vcpus    []*vCPU
+	mu    sync.Mutex
+	vcpus []*vCPU
+	// maxVCPUs is the number of application contexts that may run
+	// concurrently (Platform.ConcurrencyCount).
 	maxVCPUs int
+	// vcpuLimit caps the per-thread vCPU pool. HVF binds each vCPU to the
+	// OS thread that created it, and task goroutines may run on more OS
+	// threads than maxVCPUs: GOMAXPROCS is raised above the CPU count and
+	// threads blocked in cgo calls are replaced.
+	vcpuLimit int
 
 	// ipaAlloc assigns unique IPAs to host memory pages.
 	ipaAlloc *ipaAllocator
+
+	// memFile maps the sentry's MemoryFile into the HVF IPA space.
+	memFile memFileMapper
 
 	// ptAlloc allocates page table pages in the HVF IPA space.
 	ptAlloc *ptPageAllocator
@@ -99,6 +126,10 @@ type machine struct {
 	// (used on ASID wrap). Set by setupSharedMemory().
 	fullTLBIStubOff uint64
 
+	// entryStubsEnd is the vectors-page offset just past the entry stubs,
+	// which start at entryStubOff. Set by setupSharedMemory().
+	entryStubsEnd uint64
+
 	// kernelPT is the shared kernel page table for TTBR1_EL1.
 	// It maps upper-half VAs for the sentry (Go heap, stacks).
 	// Shared across all vCPUs.
@@ -111,10 +142,20 @@ func newMachine() (*machine, error) {
 		maxVCPUs = 64
 	}
 
+	vcpuLimit := maxThreadVCPUs
+	var hvMax C.uint32_t
+	if C.hv_vm_get_max_vcpu_count(&hvMax) == C.HV_SUCCESS && int(hvMax) < vcpuLimit {
+		vcpuLimit = int(hvMax)
+	}
+	if vcpuLimit < maxVCPUs {
+		maxVCPUs = vcpuLimit
+	}
+
 	m := &machine{
-		maxVCPUs: maxVCPUs,
-		ipaAlloc: newIPAAllocator(),
-		ptAlloc:  newPTPageAllocator(),
+		maxVCPUs:  maxVCPUs,
+		vcpuLimit: vcpuLimit,
+		ipaAlloc:  newIPAAllocator(),
+		ptAlloc:   newPTPageAllocator(),
 	}
 
 	// Set up shared VM resources (vectors + page tables).
@@ -241,10 +282,10 @@ func (m *machine) Get() *vCPU {
 	// Hold the lock across createVCPU to prevent concurrent goroutines
 	// from assigning duplicate IDs or racing on the vcpus slice.
 	id := len(m.vcpus)
-	if id >= m.maxVCPUs {
+	if id >= m.vcpuLimit {
 		m.mu.Unlock()
 		runtime.UnlockOSThread()
-		panic(fmt.Sprintf("vCPU limit reached (%d), cannot create more", m.maxVCPUs))
+		panic(fmt.Sprintf("vCPU limit reached (%d), cannot create more", m.vcpuLimit))
 	}
 
 	c, err := m.createVCPU(id)
@@ -265,4 +306,34 @@ func (m *machine) Get() *vCPU {
 // The vCPU remains associated with the current thread for reuse.
 func (m *machine) Put(_ *vCPU) {
 	runtime.UnlockOSThread()
+}
+
+// flushTLB returns once no vCPU can use translations of as that it cached
+// before the call, so that IPAs cleared from as's page table can be
+// released. The caller must have made its page table changes visible.
+//
+// vCPUs running as are forced out of the guest. Every guest entry uses a
+// fresh ASID, so translations cached under the old ASID are never reused.
+func (m *machine) flushTLB(as *addressSpace) {
+	m.mu.Lock()
+	vcpus := m.vcpus
+	m.mu.Unlock()
+
+	var gens [maxThreadVCPUs]uint64
+	for i, c := range vcpus {
+		gen := c.runGen.Load()
+		if gen%2 == 0 || c.running.Load() != as {
+			continue
+		}
+		gens[i] = gen
+		C.hv_vcpus_exit(&c.vcpuID, 1)
+	}
+	for i, c := range vcpus {
+		if gens[i] == 0 {
+			continue
+		}
+		for c.runGen.Load() == gens[i] {
+			runtime.Gosched()
+		}
+	}
 }

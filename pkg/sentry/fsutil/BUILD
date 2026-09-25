@@ -160,11 +160,17 @@ go_test(
     size = "small",
     srcs = [
         "dirty_set_test.go",
+        "file_range_set_test.go",
+        "mmap_file_test.go",
     ],
     library = ":fsutil",
     deps = [
+        "//pkg/context",
         "//pkg/hostarch",
+        "//pkg/safemem",
         "//pkg/sentry/memmap",
+        "//pkg/sentry/pgalloc",
         "//pkg/sentry/usage",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )

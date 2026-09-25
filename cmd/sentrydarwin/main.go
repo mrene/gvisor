@@ -29,20 +29,23 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"sync/atomic"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	pkgcontext "gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/devices/memdev"
 	"gvisor.dev/gvisor/pkg/sentry/devices/ttydev"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/dev"
@@ -50,23 +53,21 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/devtmpfs"
 	goferfs "gvisor.dev/gvisor/pkg/sentry/fsimpl/gofer"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/overlay"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/proc"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
-	pkgcontext "gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/loader"
-	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform/hvf"
 	_ "gvisor.dev/gvisor/pkg/sentry/platform/platforms"
-	"gvisor.dev/gvisor/pkg/sentry/socket/netstack" // also registers AF_INET provider
 	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink"        // AF_NETLINK provider
 	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink/route"  // NETLINK_ROUTE provider
 	_ "gvisor.dev/gvisor/pkg/sentry/socket/netlink/uevent" // NETLINK_KOBJECT_UEVENT
+	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"         // also registers AF_INET provider
 	_ "gvisor.dev/gvisor/pkg/sentry/socket/unix"           // AF_UNIX provider
 	"gvisor.dev/gvisor/pkg/sentry/strace"
 	_ "gvisor.dev/gvisor/pkg/sentry/syscalls/linux" // register syscall table
@@ -90,31 +91,42 @@ import (
 	"gvisor.dev/gvisor/pkg/unet"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
-	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/runsc/fsgofer"
 )
 
 var (
-	flagStrace     = flag.Bool("strace", false, "enable system call tracing")
-	flagDebug      = flag.Bool("debug", false, "enable debug logging")
-	flagLog        = flag.String("log", "", "file path for log output (default: stderr)")
-	flagRootfs     = flag.String("rootfs", "", "host directory to use as guest root filesystem (via gofer)")
-	flagNet        = flag.String("net", "", "networking mode: proxy (default), utun (root), vmnet (rootless daemon)")
-	flagNetwork    = flag.String("network", "", "alias for --net (runsc compat)")
+	flagStrace      = flag.Bool("strace", false, "enable system call tracing")
+	flagDebug       = flag.Bool("debug", false, "enable debug logging")
+	flagLog         = flag.String("log", "", "file path for log output (default: stderr)")
+	flagRootfs      = flag.String("rootfs", "", "host directory to use as guest root filesystem (via gofer)")
+	flagNixStore    = flag.String("nix-store", "/nix/store", "host Nix store to mount read-only at /nix/store (empty disables)")
+	flagNixOverlay  = flag.Bool("nix-store-overlay", false, "make /nix/store writable through an in-memory copy-on-write layer over the host store (changes are discarded on exit)")
+	flagCwd         = flag.Bool("cwd", true, "mount the host working directory read-write at the same guest path and start there (ignored with --rootfs)")
+	flagHome        = flag.Bool("home", false, "mount $HOME read-write at the same guest path and set HOME to it")
+	flagNet         = flag.String("net", "", "networking mode: proxy (default), utun (root), vmnet (rootless daemon)")
+	flagNetwork     = flag.String("network", "", "alias for --net (runsc compat)")
 	flagVmnetSocket = flag.String("vmnet-socket", "", "socket_vmnet Unix socket path (default: auto-detect)")
-	flagGuestIP    = flag.String("guest-ip", "192.168.105.100", "guest IP address for vmnet mode")
-	flagCPUs       = flag.Int("cpus", 0, "number of vCPUs (0 = auto-detect)")
-	flagKeepRoot   = flag.Bool("keep-root", false, "don't drop root privileges after network setup")
-	flagRootless   = flag.Bool("rootless", false, "run without root (no utun, no privilege drop)")
-	flagPlatform   = flag.String("platform", "hvf", "platform backend: hvf (default)")
-	flagDirectfs   = flag.Bool("directfs", false, "enable directfs mode (bypass lisafs RPC)")
-	flagPage4K     = flag.Bool("page4k", true, "use 4K guest pages (default, matching Linux ARM64)")
-	flagPage16K    = flag.Bool("page16k", false, "use 16K guest pages (macOS native)")
-	flagProfile    = flag.String("profile", "", "write per-Switch() timing stats to file")
-	flagMachMemory = flag.Bool("mach-memory", false, "use Mach anonymous memory for MemoryFile")
-	flagCheckpoint = flag.String("checkpoint", "", "save checkpoint to path on SIGUSR1")
-	flagRestore    = flag.String("restore", "", "restore kernel state from checkpoint file")
+	flagGuestIP     = flag.String("guest-ip", "192.168.105.100", "guest IP address for vmnet mode")
+	flagCPUs        = flag.Int("cpus", 0, "number of vCPUs (0 = auto-detect)")
+	flagKeepRoot    = flag.Bool("keep-root", false, "don't drop root privileges after network setup")
+	flagRootless    = flag.Bool("rootless", false, "run without root (no utun, no privilege drop)")
+	flagPlatform    = flag.String("platform", "hvf", "platform backend: hvf (default)")
+	flagDirectfs    = flag.Bool("directfs", false, "enable directfs mode (bypass lisafs RPC)")
+	flagPage4K      = flag.Bool("page4k", true, "use 4K guest pages (default, matching Linux ARM64)")
+	flagPage16K     = flag.Bool("page16k", false, "use 16K guest pages (macOS native)")
+	flagProfile     = flag.String("profile", "", "write per-Switch() timing stats to file")
+	flagCheckpoint  = flag.String("checkpoint", "", "save checkpoint to path on SIGUSR1")
+	flagRestore     = flag.String("restore", "", "restore kernel state from checkpoint file")
+	flagNixBuild    = flag.Bool("nix-build", false, "run the Nix derivation build described by the build.json given as the final argument (for Nix's external-builders setting)")
+	flagNixBuildSh  = flag.String("nix-build-sh", "", "with --nix-build, the target of /bin/sh in the guest, e.g. a static busybox in the Nix store")
 )
+
+// flagMounts holds repeated --mount flags.
+var flagMounts mountFlag
+
+func init() {
+	flag.Var(&flagMounts, "mount", "mount a host directory in the guest: HOST[:GUEST][:ro|:rw] (GUEST defaults to HOST; repeatable)")
+}
 
 func main() {
 	// Rewrite bare "--net" (no value) to "--net=proxy" (zero-dependency default).
@@ -136,6 +148,36 @@ func main() {
 		*flagNet = *flagNetwork
 	}
 
+	// With --nix-build, Nix passes the build description as the final
+	// argument, and the derivation's builder replaces the command line.
+	var nb *nixBuild
+	nbFixedOutput := false
+	if *flagNixBuild {
+		// Nix treats everything written after this line as the build log.
+		os.Stderr.WriteString("\x02\n")
+		var err error
+		if nb, err = readNixBuild(flag.Arg(flag.NArg() - 1)); err != nil {
+			fatal("%v", err)
+		}
+		if nbFixedOutput, err = nb.fixedOutput(); err != nil {
+			fatal("%v", err)
+		}
+		// The builder writes to the host store through an in-memory
+		// copy-on-write layer; only its outputs are copied to the host.
+		*flagNixStore = nb.RealStoreDir
+		*flagNixOverlay = true
+		*flagCwd = false
+		*flagHome = false
+		// As in Nix's sandbox, only fixed-output derivations get a network.
+		if nbFixedOutput && *flagNet == "" {
+			*flagNet = "proxy"
+		}
+		// Keep sentry messages out of the build log.
+		if *flagLog == "" && nb.TopTmpDir != "" {
+			*flagLog = filepath.Join(nb.TopTmpDir, "sentrydarwin.log")
+		}
+	}
+
 	// --rootless implies no utun (needs root) and no privilege drop
 	if *flagRootless {
 		*flagKeepRoot = true
@@ -155,25 +197,15 @@ func main() {
 		log.SetTarget(&log.Writer{Next: f})
 	}
 
-	// Enable Mach anonymous memory if requested.
-	if *flagMachMemory {
-		pgalloc.SetUseMachMemory(true)
-		log.Infof("Using Mach anonymous memory for MemoryFile (experimental)")
-		fmt.Fprintf(os.Stderr, "[mach-memory] Enabled: MemoryFile backed by mach_make_memory_entry_64\n")
-	}
-
-	// 4K guest pages (default). Linux ARM64 universally uses 4K pages.
-	// --page16k overrides to macOS-native 16K if needed.
-	if *flagPage4K && !*flagPage16K {
-		mm.SetPage4KMode(true)
-		log.Infof("4K guest pages enabled (AT_PAGESZ=4096)")
-	}
-
 	// Configure ARM64 address space for VA48 (256TB).
 	arch.ConfigureAddressSpace(1 << 48)
 
 	elfPath := flag.Arg(0)
 	guestArgs := flag.Args()
+	if nb != nil {
+		elfPath = nb.Builder
+		guestArgs = nb.argv()
+	}
 
 	// Initialize memory usage tracking.
 	if err := usage.Init(); err != nil {
@@ -204,6 +236,7 @@ func main() {
 	if err != nil {
 		fatal("NewMemoryFile: %v", err)
 	}
+	plat.SetMemoryFile(mf)
 	k.SetMemoryFile(mf)
 
 	// Prepare VDSO.
@@ -281,6 +314,11 @@ func main() {
 		AllowUserMount: true,
 		AllowUserList:  true,
 	})
+	vfsObj.MustRegisterFilesystemType(goferfs.Name, &goferfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+		AllowUserMount: true,
+		AllowUserList:  true,
+	})
+	vfsObj.MustRegisterFilesystemType(overlay.Name, &overlay.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{})
 
 	// Register devices.
 	if err := memdev.Register(vfsObj); err != nil {
@@ -340,7 +378,7 @@ func main() {
 	root := mntns.Root(k.SupervisorContext())
 	defer root.DecRef(k.SupervisorContext())
 
-	for _, dir := range []string{"/proc", "/dev", "/dev/pts", "/tmp"} {
+	for _, dir := range []string{"/proc", "/dev", "/dev/pts", "/tmp", "/nix", "/nix/store"} {
 		pop := vfs.PathOperation{
 			Root:  root,
 			Start: root,
@@ -394,6 +432,77 @@ func main() {
 		}
 		if _, err := vfsObj.MountAt(k.SupervisorContext(), creds, "none", &tmpPop, tmpfs.Name, &vfs.MountOptions{}); err != nil {
 			log.Warningf("mount /tmp: %v", err)
+		}
+	}
+
+	// Make host Nix closures available at their original absolute paths. The
+	// initial executable can be imported through a host FD, but its ELF
+	// interpreter and shared libraries are resolved through the guest VFS.
+	var existingMounts []bindMount
+	if *flagNixStore != "" {
+		hostNixStore, err := filepath.Abs(*flagNixStore)
+		if err != nil {
+			fatal("abs nix store path: %v", err)
+		}
+		if st, err := os.Stat(hostNixStore); err != nil {
+			if !os.IsNotExist(err) {
+				fatal("stat nix store %q: %v", hostNixStore, err)
+			}
+			log.Debugf("host Nix store %q does not exist; skipping mount", hostNixStore)
+		} else if !st.IsDir() {
+			fatal("host Nix store %q is not a directory", hostNixStore)
+		} else {
+			if *flagNixOverlay {
+				err = mountGoferOverlay(k, vfsObj, creds, root, hostNixStore, "/nix/store", "nix-store")
+			} else {
+				err = mountGofer(k, vfsObj, creds, root, hostNixStore, "/nix/store", true, "nix-store")
+			}
+			if err != nil {
+				fatal("mount host Nix store %q at /nix/store: %v", hostNixStore, err)
+			}
+			existingMounts = append(existingMounts, bindMount{host: hostNixStore, guest: "/nix/store", readOnly: !*flagNixOverlay})
+		}
+	}
+
+	// Share host directories: explicit --mount flags, $HOME with --home, and
+	// the working directory (unless the guest has its own --rootfs).
+	var hostHome, hostCwd string
+	if *flagHome {
+		if hostHome, err = os.UserHomeDir(); err != nil {
+			fatal("--home: %v", err)
+		}
+		hostHome = filepath.Clean(hostHome)
+	}
+	if *flagCwd && *flagRootfs == "" {
+		if hostCwd, err = os.Getwd(); err != nil {
+			fatal("--cwd: %v", err)
+		}
+	}
+	plan, err := planMounts(flagMounts, hostHome, hostCwd, existingMounts)
+	if err != nil {
+		fatal("%v", err)
+	}
+	if hostCwd != "" && hostCwd != "/" && plan.workDir == "" {
+		log.Warningf("not sharing working directory %s: its guest path is reserved or used by --mount", hostCwd)
+	}
+	for _, b := range plan.mounts {
+		if err := mkdirAllGuest(k, vfsObj, creds, root, b.guest); err != nil {
+			fatal("create guest mount point for %s: %v", b, err)
+		}
+		if err := mountGofer(k, vfsObj, creds, root, b.host, b.guest, b.readOnly, "mount:"+b.guest); err != nil {
+			fatal("mount %s: %v", b, err)
+		}
+	}
+	visibleMounts := append(append([]bindMount(nil), plan.mounts...), existingMounts...)
+	guestHome := "/root"
+	if hostHome != "" {
+		if g, ok := guestPathOf(hostHome, visibleMounts); ok {
+			guestHome = g
+		}
+	}
+	if nb != nil {
+		if err := setupNixBuildRoot(k, vfsObj, creds, root, nb, *flagNixBuildSh, nbFixedOutput); err != nil {
+			fatal("%v", err)
 		}
 	}
 
@@ -465,7 +574,10 @@ func main() {
 			if err != nil {
 				fatal("dup fd %d: %v", hostFD, err)
 			}
-			isTTY := stdinIsTerminal
+			// Only fds that are themselves terminals share the stdin TTY;
+			// stdout/stderr redirected elsewhere must keep their own target.
+			_, ttyErr := unix.IoctlGetTermios(hostFD, unix.TIOCGETA)
+			isTTY := stdinIsTerminal && ttyErr == nil
 
 			var f *vfs.FileDescription
 			if isTTY && stdinFile != nil && hostFD > 0 {
@@ -473,6 +585,11 @@ func main() {
 				f = stdinFile
 				f.IncRef()
 			} else {
+				// HostOffset: like Linux fds inherited across exec, the
+				// guest shares the offset of the host open file description
+				// with the parent (e.g. a shell redirecting to a file), with
+				// the sentry's own log on fd 2, and between stdout and
+				// stderr when both refer to the same description.
 				f, err = host.NewFD(ctx, k.HostMount(), newFD, &host.NewFDOptions{
 					IsTTY:      isTTY,
 					Savable:    true,
@@ -480,6 +597,7 @@ func main() {
 					RestoreKey: checkpoint.ResourceID{
 						Path: fmt.Sprintf("stdio:%d", hostFD),
 					},
+					HostOffset: true,
 				})
 				if err != nil {
 					unix.Close(newFD)
@@ -500,18 +618,27 @@ func main() {
 		}
 	}
 
-	// Create the initial process. If --rootfs is set, resolve the
-	// binary from the guest VFS. Otherwise, open it from the host.
+	// Create the initial process. If --rootfs or --nix-build is set, resolve
+	// the binary from the guest VFS. Otherwise, run it by the guest path of the
+	// host file if a mount shows it (like execve(2): an interpreter script is
+	// reopened by that name, which also becomes AT_EXECFN and
+	// /proc/self/exe), else import it through a host FD.
 	var elfFile *vfs.FileDescription
 	guestFilename := ""
-	if *flagRootfs != "" {
-		// Resolve from guest VFS (the binary was copied into tmpfs).
+	if *flagRootfs != "" || nb != nil {
+		// Resolve from guest VFS (the rootfs, or the Nix store).
 		guestFilename = elfPath
+	} else if g, ok := guestExecPath(elfPath, visibleMounts); ok {
+		guestFilename = g
 	} else {
-		// Open directly from host filesystem.
 		elfFD, err := unix.Open(elfPath, unix.O_RDONLY, 0)
 		if err != nil {
 			fatal("open %s: %v", elfPath, err)
+		}
+		// The interpreter of a script would have to open it by name.
+		var magic [2]byte
+		if n, _ := unix.Pread(elfFD, magic[:], 0); n == 2 && string(magic[:]) == "#!" {
+			fatal("%s is a script outside the guest's mounts, so its interpreter cannot open it; share its directory with --mount", elfPath)
 		}
 		elfFile, err = host.NewFD(k.SupervisorContext(), k.HostMount(), elfFD, &host.NewFDOptions{
 			Readonly: true,
@@ -521,13 +648,18 @@ func main() {
 		}
 	}
 
+	envv, workDir := guestEnv(guestHome, plan.workDir), plan.workDir
+	if nb != nil {
+		envv, workDir = nb.envv(), nb.TmpDirInSandbox
+	}
 	mntns.IncRef()
 	ls := limits.NewLimitSet()
 	tg, _, err := k.CreateProcess(kernel.CreateProcessArgs{
 		Filename:             guestFilename,
 		File:                 elfFile,
 		Argv:                 guestArgs,
-		Envv:                 guestEnv(),
+		Envv:                 envv,
+		WorkingDirectory:     workDir,
 		Credentials:          creds,
 		FDTable:              fdTable,
 		TTY:                  stdinTTY,
@@ -543,23 +675,6 @@ func main() {
 	fdTable.DecRef(ctx)
 	if err != nil {
 		fatal("CreateProcess: %v", err)
-	}
-
-	// Set the sigreturn trampoline address.
-	if leader := tg.Leader(); leader != nil {
-		if mm := leader.MemoryManager(); mm != nil {
-			mm.SetVDSOSigReturn(hvf.SigreturnAddr)
-		}
-		// Set fast-path syscall values for in-VM dispatch.
-		// getpid/gettid/getuid/geteuid handled at EL1 via ERET.
-		pid := uint16(k.RootPIDNamespace().IDOfThreadGroup(tg))
-		tid := uint16(k.RootPIDNamespace().IDOfTask(leader))
-		uid := uint16(creds.RealKUID.In(creds.UserNamespace).OrOverflow())
-		euid := uint16(creds.EffectiveKUID.In(creds.UserNamespace).OrOverflow())
-		gid := uint16(creds.RealKGID.In(creds.UserNamespace).OrOverflow())
-		egid := uint16(creds.EffectiveKGID.In(creds.UserNamespace).OrOverflow())
-		// PGID and SID default to PID for the init process
-		hvf.PatchInitFastPath(plat, pid, 0, tid, uid, euid, gid, egid, pid, pid)
 	}
 
 	log.Infof("Starting gVisor sentry kernel on macOS (HVF platform, %d CPUs)", numCPU)
@@ -630,17 +745,36 @@ func main() {
 	}
 
 	exitStatus := tg.ExitStatus()
-	log.Infof("Guest exited with status %d", exitStatus.ExitStatus())
+	exitCode := 0
+	switch {
+	case exitStatus.Exited():
+		exitCode = int(exitStatus.ExitStatus())
+	case exitStatus.Signaled():
+		// Mirror shells: report the Linux signal and exit with 128+signo.
+		sig := exitStatus.TerminationSignal()
+		fmt.Fprintf(os.Stderr, "sentry-darwin: guest terminated by signal %d\n", sig)
+		exitCode = 128 + int(sig)
+	}
+	log.Infof("Guest exited: %v", exitStatus)
+	if nb != nil && exitCode == 0 {
+		if err := copyNixBuildOutputs(ctx, vfsObj, creds, root, nb); err != nil {
+			fatal("%v", err)
+		}
+	}
 	if *flagProfile != "" {
 		hvf.DumpStats(*flagProfile)
 	}
 	if termState != nil {
 		unix.IoctlSetTermios(0, unix.TIOCSETA, termState)
 	}
-	os.Exit(int(exitStatus.ExitStatus()))
+	os.Exit(exitCode)
 }
 
 func setupGofer(k *kernel.Kernel, hostDir string) int {
+	return setupGoferConnection(k, hostDir, false)
+}
+
+func setupGoferConnection(k *kernel.Kernel, hostDir string, readonly bool) int {
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
 		fatal("socketpair: %v", err)
@@ -657,7 +791,7 @@ func setupGofer(k *kernel.Kernel, hostDir string) int {
 	connImpl := fsgofer.NewConnectionImpl(&fsgofer.Config{
 		DonateMountPointFD: *flagDirectfs,
 	})
-	conn, err := goferServer.CreateConnection(serverSock, hostDir, fsgofer.ConnectionOpts(false), connImpl)
+	conn, err := goferServer.CreateConnection(serverSock, hostDir, fsgofer.ConnectionOpts(readonly), connImpl)
 	if err != nil {
 		fatal("gofer CreateConnection: %v", err)
 	}
@@ -1013,11 +1147,14 @@ func utunUnit(name string) int {
 
 // guestEnv returns environment variables for the guest process.
 // It uses a standard Linux PATH instead of the host's macOS PATH.
-func guestEnv() []string {
+func guestEnv(home, workDir string) []string {
 	env := []string{
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		"HOME=/root",
+		"HOME=" + home,
 		"TERM=xterm",
+	}
+	if workDir != "" {
+		env = append(env, "PWD="+workDir)
 	}
 	// Pass through select environment variables from host.
 	for _, key := range []string{"LANG", "LC_ALL", "TZ"} {
@@ -1031,46 +1168,8 @@ func guestEnv() []string {
 // setupGoferRoot creates an in-process gofer filesystem backed by the host
 // directory and returns a mount namespace with it as the root.
 func setupGoferRoot(k *kernel.Kernel, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, hostDir string) *vfs.MountNamespace {
-	// Register the gofer filesystem type.
-	vfsObj.MustRegisterFilesystemType(goferfs.Name, &goferfs.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
-		AllowUserMount: true,
-		AllowUserList:  true,
-	})
-
-	// Create a Unix socketpair for the lisafs connection.
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
-	if err != nil {
-		fatal("socketpair: %v", err)
-	}
-	// Increase socket buffer for heavy workloads (e.g., Python package install).
-	unix.SetsockoptInt(fds[0], unix.SOL_SOCKET, unix.SO_RCVBUF, 1<<20)
-	unix.SetsockoptInt(fds[0], unix.SOL_SOCKET, unix.SO_SNDBUF, 1<<20)
-	unix.SetsockoptInt(fds[1], unix.SOL_SOCKET, unix.SO_RCVBUF, 1<<20)
-	unix.SetsockoptInt(fds[1], unix.SOL_SOCKET, unix.SO_SNDBUF, 1<<20)
-
-	// Start the gofer server on one end.
-	serverSock, err := unet.NewSocket(fds[0])
-	if err != nil {
-		fatal("unet.NewSocket: %v", err)
-	}
-
-	goferServer := lisafs.NewServer()
-	connImpl := fsgofer.NewConnectionImpl(&fsgofer.Config{
-		DonateMountPointFD: *flagDirectfs,
-	})
-	conn, err := goferServer.CreateConnection(serverSock, hostDir, fsgofer.ConnectionOpts(false /* readonly */), connImpl)
-	if err != nil {
-		fatal("CreateConnection: %v", err)
-	}
-	goferServer.StartConnection(conn)
-
-	// Create the mount namespace using the gofer filesystem with the
-	// client socket FD.
-	clientFD := fds[1]
-	mountOpts := fmt.Sprintf("trans=fd,rfdno=%d,wfdno=%d,cache=remote_revalidating", clientFD, clientFD)
-	if *flagDirectfs {
-		mountOpts += ",directfs"
-	}
+	clientFD := setupGoferConnection(k, hostDir, false)
+	mountOpts := goferMountData(clientFD)
 	mntns, err := vfsObj.NewMountNamespace(
 		k.SupervisorContext(),
 		creds,
@@ -1081,7 +1180,7 @@ func setupGoferRoot(k *kernel.Kernel, vfsObj *vfs.VirtualFilesystem, creds *auth
 			GetFilesystemOptions: vfs.GetFilesystemOptions{
 				Data: mountOpts,
 				InternalData: goferfs.InternalFilesystemOptions{
-					UniqueID: checkpoint.ResourceID{Path: "rootfs"},
+					UniqueID:       checkpoint.ResourceID{Path: "rootfs"},
 					LeakConnection: true,
 				},
 			},

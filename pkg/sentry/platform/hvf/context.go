@@ -136,7 +136,12 @@ type hvfContext struct {
 	interrupt   interrupt.Forwarder
 	sigMask     uint64 // cached signal mask for in-VM sigprocmask
 	sigDirty    bool   // true if EL1 handler modified the mask
-	lastVCPU    *vCPU  // last vCPU used (for state page access)
+	// fpVCPU is the vCPU that last loaded or ran with this context's
+	// FP/SIMD state. Only accessed by the task goroutine.
+	fpVCPU *vCPU
+	// fpChanged is set when the sentry has changed the FP state in the
+	// arch.Context64 since it was last loaded into a vCPU.
+	fpChanged bool
 }
 
 // SetCachedSignalMask implements platform.SignalMasker.
@@ -192,13 +197,6 @@ func (c *hvfContext) Switch(
 		return si, at, err
 	}
 
-	// Reset FP loaded flag if this vCPU was used by a different context
-	// (the sentry may have modified FP state for signal delivery).
-	if c.lastVCPU != vcpu {
-		vcpu.fpLoaded = false
-	}
-	c.lastVCPU = vcpu
-
 	// Write signal mask to state page for in-VM sigprocmask handler.
 	binary.LittleEndian.PutUint64(
 		(*[16384]byte)(vcpu.statePageHost)[spOffsetSigMask:], c.sigMask)
@@ -208,33 +206,49 @@ func (c *hvfContext) Switch(
 	unknownExits := 0
 	vtimerExits := 0
 	currentELRetries := 0
-	skipAll := false
+	// resume is set when the vCPU must continue exactly where it exited:
+	// its registers hold guest state that ac does not, so nothing may be
+	// loaded or changed before the next run.
+	resume := false
 	for {
 		t0 := time.Now()
-		vcpu.loadRegisters(ac, skipAll)
-		skipAll = false
+		if !resume {
+			if as != nil && as.pt != nil {
+				// ASID rotation: each entry uses a fresh ASID, which the
+				// entry stub flushes (TLBI ASIDE1IS) before returning to
+				// EL0: the sentry may have modified page tables since the
+				// last exit (e.g., mapping new pages after a fault).
+				vcpu.asidCounter++
+				asid := uint64(vcpu.asidCounter & 0xFFFF)
+				if asid == 0 {
+					asid = 1
+					vcpu.asidCounter = 1
+					vcpu.asidWrapped = true
+				}
+				ttbr := as.pt.ttbr0() | (asid << 48)
+				vcpu.setSysReg(C.HV_SYS_REG_TTBR0_EL1, ttbr)
+			}
+			// The vCPU's FP/SIMD registers are current for this context
+			// only if this context last ran on this vCPU, no other context
+			// ran on it since, and the sentry did not change the state in
+			// ac. Otherwise load it from ac, which holds the state saved at
+			// the last exit.
+			loadFP := vcpu.fpOwner != c || c.fpVCPU != vcpu || c.fpChanged
+			vcpu.loadRegisters(ac, loadFP)
+			vcpu.fpOwner = c
+			c.fpVCPU = vcpu
+			c.fpChanged = false
+		}
+		resume = false
 		t1 := time.Now()
 
 		C.clearExclusiveMonitor()
 		C.memoryBarrier()
 
-		if as != nil && as.pt != nil {
-			// ASID rotation: each Switch() gets a unique ASID to avoid
-			// TLB aliasing. TLBI is needed every re-entry because the
-			// sentry may have modified page tables between exits (e.g.,
-			// mapping new pages after a fault).
-			vcpu.asidCounter++
-			asid := uint64(vcpu.asidCounter & 0xFFFF)
-			if asid == 0 {
-				asid = 1
-				vcpu.asidCounter = 1
-				vcpu.asidWrapped = true
-			}
-			ttbr := as.pt.ttbr0() | (asid << 48)
-			vcpu.setSysReg(C.HV_SYS_REG_TTBR0_EL1, ttbr)
-		}
-
+		vcpu.running.Store(as)
+		vcpu.runGen.Add(1)
 		ret := C.vcpuRunUntilForever(vcpu.vcpuID)
+		vcpu.runGen.Add(1)
 		t2 := time.Now()
 
 		C.memoryBarrier()
@@ -256,13 +270,13 @@ func (c *hvfContext) Switch(
 
 			log.Debugf("HVF exit: ec=%#x syndrome=%#x", ec, syndrome)
 
-			// EC=0x18: MSR/MRS trap from TID3 (direct EL2 trap, no HVC).
+			// EC=0x18: MSR/MRS trap from TID3 (direct EL2 trap from EL0, no HVC).
 			if ec == 0x18 {
 				vcpu.saveFP = true
-				vcpu.saveRegisters(ac)
+				vcpu.saveEL0Registers(ac)
 				iss := syndrome & 0x1ffffff
 				if emulateSysreg(ac, iss) {
-					ac.Regs.Pc = vcpu.getReg(C.HV_REG_PC) + 4
+					ac.Regs.Pc += 4
 					continue
 				}
 				c.info = linux.SignalInfo{}
@@ -277,6 +291,7 @@ func (c *hvfContext) Switch(
 				// GP regs saved to state page by STP chain.
 				if hvcImm == 9 {
 					vcpu.gpInStatePage = true
+					vcpu.gpInVectorScratch = true
 					vcpu.saveFP = true
 					vcpu.saveRegisters(ac)
 					t3 := time.Now()
@@ -292,31 +307,16 @@ func (c *hvfContext) Switch(
 					return returnAndRelease(nil, hostarch.NoAccess, nil)
 				}
 
-				// HVC #0/#8: fault or other exception. The el0_sync
+				// HVC #8: fault or other exception. The el0_sync
 				// handler saved the original ESR_EL1 in X18 before HVC
 				// (HVC overwrites ESR_EL1 with HVC syndrome).
-				if hvcImm == 0 || hvcImm == 8 {
+				if hvcImm == 8 {
 					statFaultCount.Add(1)
-					// Read ESR before saveRegisters to determine FP save need.
-					var esrEL1 uint64
-					if hvcImm == 8 {
-						esrEL1 = vcpu.getReg(C.HV_REG_X18)
-					} else {
-						esrEL1 = vcpu.getSysReg(C.HV_SYS_REG_ESR_EL1)
-					}
+					esrEL1 := vcpu.getReg(C.HV_REG_X18)
+					vcpu.gpInVectorScratch = true
 					origEC := (esrEL1 >> 26) & 0x3f
-					vcpu.saveFP = origEC != 0x15 // skip FP for SVC fallback
+					vcpu.saveFP = true
 					vcpu.saveRegisters(ac)
-
-					if origEC == 0x15 { // SVC from AArch64 (fallback)
-						statSwitchCount.Add(1)
-						if nr := ac.Regs.Regs[8]; nr < 512 {
-							statSyscallNr[nr].Add(1)
-						}
-						log.Debugf("HVF syscall (hvc#%d fallback): nr=%d pc=%#x",
-							hvcImm, ac.Regs.Regs[8], ac.Regs.Pc)
-						return returnAndRelease(nil, hostarch.NoAccess, nil)
-					}
 
 					// Data/instruction abort: EC=0x24/0x20 (lower EL, guest at EL0) or
 					// EC=0x25/0x21 (current EL, e.g. fault in EL1 stub).
@@ -350,16 +350,6 @@ func (c *hvfContext) Switch(
 					return returnAndRelease(&c.info, hostarch.NoAccess, platform.ErrContextSignal)
 				}
 
-				if hvcImm == 4 {
-					// Current-EL sync fault (vector 0x200). X18=ESR, X17=FAR.
-					esrVal := vcpu.getReg(C.HV_REG_X18)
-					farVal := vcpu.getReg(C.HV_REG_X17)
-					pc := vcpu.getReg(C.HV_REG_PC)
-					ec4 := (esrVal >> 26) & 0x3f
-					dfsc := esrVal & 0x3f
-					log.Warningf("HVF: current-EL fault: ESR=%#x (EC=%#x DFSC=%#x level=%d) FAR=%#x PC=%#x",
-						esrVal, ec4, dfsc, dfsc&3, farVal, pc)
-				}
 				vcpu.saveFP = true
 				vcpu.saveRegisters(ac)
 				log.Warningf("HVF: unexpected HVC #%d, syndrome=%#x", hvcImm, syndrome)
@@ -369,15 +359,15 @@ func (c *hvfContext) Switch(
 			}
 
 			if ec == 0x25 || ec == 0x21 {
-				// Current-EL abort: EL1 handler faulted (e.g., TTBR1
-				// state page TLB miss). Re-enter to let the 0x200
-				// handler resolve it. Only retry for translation faults
+				// Current-EL abort taken to the host: an EL1 handler
+				// faulted at stage 2. Resume unchanged to retry the
+				// faulting instruction. Only retry for translation faults
 				// (DFSC 0x04-0x07); permission faults indicate a real
 				// mapping error and must not spin.
 				dfsc := syndrome & 0x3f
 				if dfsc >= 0x04 && dfsc <= 0x07 && currentELRetries < 100 {
 					currentELRetries++
-					skipAll = true
+					resume = true
 					continue
 				}
 				log.Warningf("HVF: current-EL abort not recoverable: EC=%#x DFSC=%#x retries=%d",
@@ -391,8 +381,7 @@ func (c *hvfContext) Switch(
 			}
 			if ec == 0x24 || ec == 0x20 { // Lower-EL data/instruction abort
 				vcpu.saveFP = true
-				vcpu.saveRegisters(ac)
-				ac.Regs.Pc = vcpu.getReg(C.HV_REG_PC)
+				vcpu.saveEL0Registers(ac)
 				far := vcpu.getFaultAddress()
 				c.info = linux.SignalInfo{}
 				c.info.Signo = int32(linux.SIGSEGV)
@@ -401,9 +390,8 @@ func (c *hvfContext) Switch(
 			}
 
 			vcpu.saveFP = true
-			vcpu.saveRegisters(ac)
-			illPC := vcpu.getReg(C.HV_REG_PC)
-			ac.Regs.Pc = illPC
+			vcpu.saveEL0Registers(ac)
+			illPC := ac.Regs.Pc
 			c.info = linux.SignalInfo{}
 			c.info.Signo = int32(linux.SIGILL)
 			c.info.SetAddr(illPC)
@@ -420,11 +408,31 @@ func (c *hvfContext) Switch(
 			} else {
 				C.hv_vcpu_set_vtimer_mask(vcpu.vcpuID, C.bool(false))
 			}
-			skipAll = true // no register changes on vtimer
+			resume = true
 			continue
 
 		case exitReasonCanceled:
-			return returnAndRelease(nil, hostarch.NoAccess, platform.ErrContextInterrupt)
+			// hv_vcpus_exit (interrupt delivery or machine.flushTLB) stops
+			// the vCPU wherever it is. The guest must later continue from
+			// exactly that point, not from the state last loaded from ac.
+			switch {
+			case vcpu.atEL0():
+				// Application code: its whole state is in the registers.
+				vcpu.saveFP = true
+				vcpu.saveEL0Registers(ac)
+				return returnAndRelease(nil, hostarch.NoAccess, platform.ErrContextInterrupt)
+			case c.machine.inEntryStub(vcpu.getReg(C.HV_REG_PC)):
+				// Not yet back at EL0, so ac is still the state being
+				// entered; the next entry loads it again.
+				return returnAndRelease(nil, hostarch.NoAccess, platform.ErrContextInterrupt)
+			default:
+				// In an EL1 exception handler, which has begun moving
+				// the application state out of the registers and exits
+				// with HVC when done. Let it finish: the interrupt is
+				// handled after that exit.
+				resume = true
+				continue
+			}
 
 		default:
 			unknownExits++
@@ -433,7 +441,7 @@ func (c *hvfContext) Switch(
 					fmt.Errorf("HVF: too many unknown exit reasons (%d), last=%d", unknownExits, exitReason))
 			}
 			log.Debugf("HVF: unknown exit reason %d, retrying (%d)", exitReason, unknownExits)
-			skipAll = true
+			resume = true
 			continue
 		}
 	}
@@ -459,9 +467,7 @@ func (c *hvfContext) PullFullState(_ platform.AddressSpace, _ *arch.Context64) e
 // Called when the sentry modifies registers beyond the syscall return value
 // (e.g., signal delivery, clone, execve, rt_sigreturn).
 func (c *hvfContext) FullStateChanged() {
-	if c.lastVCPU != nil {
-		c.lastVCPU.fpLoaded = false
-	}
+	c.fpChanged = true
 }
 
 // PrepareSleep implements platform.Context.PrepareSleep.

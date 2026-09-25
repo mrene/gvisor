@@ -139,6 +139,13 @@ type inode struct {
 	// This field is initialized at creation time and is immutable.
 	restorable bool
 
+	// hostOffset is true if the file offset of seekable files is the offset
+	// of hostFD's host open file description rather than
+	// fileDescription.offset. See NewFDOptions.HostOffset.
+	//
+	// This field is initialized at creation time and is immutable.
+	hostOffset bool
+
 	// readonly is true if operations that can potentially change the host file
 	// are blocked.
 	//
@@ -262,6 +269,17 @@ type NewFDOptions struct {
 	// If Readonly is true, we disallow operations that can potentially change
 	// the host file associated with the file descriptor.
 	Readonly bool
+
+	// If HostOffset is true, the file offset of a seekable host FD is the
+	// offset of the host open file description, as with Linux file
+	// descriptions inherited across fork/exec: read(2), write(2) and lseek(2)
+	// use and update the host offset, so the application observes writes by
+	// other holders of the host file description (e.g. a parent shell that
+	// redirected stdio to a file) and vice versa. O_APPEND is implemented by
+	// the host, so it follows the host file description's flags; changes made
+	// by the application with fcntl(F_SETFL) are not propagated to the host.
+	// Otherwise, the file description has a private offset starting at 0.
+	HostOffset bool
 }
 
 // NewFD returns a vfs.FileDescription representing the given host file
@@ -322,6 +340,7 @@ func NewFD(ctx context.Context, mnt *vfs.Mount, hostFD int, opts *NewFDOptions) 
 		i.virtualOwner.mode = atomicbitops.FromUint32(uint32(stat.Mode))
 	}
 	i.restorable = opts.Restorable
+	i.hostOffset = opts.HostOffset
 
 	d := &kernfs.Dentry{}
 	d.Init(&fs.Filesystem, i)
@@ -329,9 +348,10 @@ func NewFD(ctx context.Context, mnt *vfs.Mount, hostFD int, opts *NewFDOptions) 
 	// i.open will take a reference on d.
 	defer d.DecRef(ctx)
 
-	// For simplicity, fileDescription.offset is set to 0. Technically, we
-	// should only set to 0 on files that are not seekable (sockets, pipes,
-	// etc.), and use the offset from the host fd otherwise when importing.
+	// Unless opts.HostOffset is set, fileDescription.offset is set to 0 for
+	// simplicity. Technically, we should only set to 0 on files that are not
+	// seekable (sockets, pipes, etc.), and use the offset from the host fd
+	// otherwise when importing.
 	return i.open(ctx, d, mnt, fileType, flags)
 }
 
@@ -733,7 +753,7 @@ type fileDescription struct {
 	offsetMu sync.Mutex `state:"nosave"`
 
 	// offset specifies the current file offset. It is only meaningful when
-	// inode.seekable is true.
+	// inode.seekable is true and inode.hostOffset is false.
 	offset int64
 }
 
@@ -788,7 +808,8 @@ func (f *fileDescription) Read(ctx context.Context, dst usermem.IOSequence, opts
 	}
 
 	i := f.inode
-	if !i.seekable {
+	if !i.seekable || i.hostOffset {
+		// Use (and let the host advance) the host file description's offset.
 		bufN, err := i.readFromBuf(ctx, &dst)
 		if err != nil {
 			return bufN, err
@@ -852,7 +873,9 @@ func (f *fileDescription) PWrite(ctx context.Context, src usermem.IOSequence, of
 // Write implements vfs.FileDescriptionImpl.Write.
 func (f *fileDescription) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
 	i := f.inode
-	if !i.seekable {
+	if !i.seekable || i.hostOffset {
+		// Use (and let the host advance) the host file description's offset.
+		// If the file is seekable, this also leaves O_APPEND to the host.
 		n, err := f.writeToHostFD(ctx, src, -1, opts.Flags)
 		if isBlockError(err) {
 			err = linuxerr.ErrWouldBlock
@@ -910,6 +933,19 @@ func (f *fileDescription) Seek(_ context.Context, offset int64, whence int32) (i
 		return 0, linuxerr.ESPIPE
 	}
 
+	hostWhence, ok := hostSeekWhence(whence)
+	if !ok {
+		return 0, linuxerr.EINVAL
+	}
+
+	if i.hostOffset {
+		n, err := unix.Seek(i.hostFD, offset, hostWhence)
+		if err != nil {
+			return 0, err
+		}
+		return n, nil
+	}
+
 	f.offsetMu.Lock()
 	defer f.offsetMu.Unlock()
 
@@ -951,18 +987,34 @@ func (f *fileDescription) Seek(_ context.Context, offset int64, whence int32) (i
 		// this is the only place where we use it.
 		//
 		// For reading and writing, we always rely on our internal offset.
-		n, err := unix.Seek(i.hostFD, offset, int(whence))
+		n, err := unix.Seek(i.hostFD, offset, hostWhence)
 		if err != nil {
 			return f.offset, err
 		}
 		f.offset = n
-
-	default:
-		// Invalid whence.
-		return f.offset, linuxerr.EINVAL
 	}
 
 	return f.offset, nil
+}
+
+// hostSeekWhence converts a Linux lseek(2) whence to the host's value, which
+// differs for SEEK_DATA and SEEK_HOLE on some hosts (e.g. macOS). ok is false
+// if whence is invalid.
+func hostSeekWhence(whence int32) (hostWhence int, ok bool) {
+	switch whence {
+	case linux.SEEK_SET:
+		return unix.SEEK_SET, true
+	case linux.SEEK_CUR:
+		return unix.SEEK_CUR, true
+	case linux.SEEK_END:
+		return unix.SEEK_END, true
+	case linux.SEEK_DATA:
+		return unix.SEEK_DATA, true
+	case linux.SEEK_HOLE:
+		return unix.SEEK_HOLE, true
+	default:
+		return 0, false
+	}
 }
 
 // Sync implements vfs.FileDescriptionImpl.Sync.

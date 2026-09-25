@@ -80,6 +80,8 @@ func (seg FileRangeIterator) FileRangeOf(mr memmap.MappableRange) memmap.FileRan
 // PagesToFill returns the number of pages that that Fill() will allocate
 // for the given required and optional parameters.
 func (s *FileRangeSet) PagesToFill(required, optional memmap.MappableRange) uint64 {
+	required = roundOutToHostPages(required)
+	optional = roundOutToHostPages(optional)
 	var numPages uint64
 	gap := s.LowerBoundGap(required.Start)
 	for gap.Ok() && gap.Start() < required.End {
@@ -101,16 +103,24 @@ func (s *FileRangeSet) PagesToFill(required, optional memmap.MappableRange) uint
 // calling readAt.
 //
 // Fill may read offsets outside of required, but will never read offsets
-// outside of optional. It returns a non-nil error if any error occurs, even
-// if the error only affects offsets in optional, but not in required.
+// outside of optional rounded out to host page boundaries. It returns a
+// non-nil error if any error occurs, even if the error only affects offsets
+// in optional, but not in required.
+//
+// MemoryFile allocates whole host pages, which may be larger than guest
+// pages, so Fill always fills whole host pages: segments inserted by Fill
+// are host-page-aligned.
 //
 // Fill returns the number of pages that were allocated.
 //
 // Preconditions:
 //   - required.Length() > 0.
 //   - optional.IsSupersetOf(required).
-//   - required and optional must be page-aligned.
+//   - required and optional must be guest-page-aligned.
+//   - Existing segments in s must be host-page-aligned.
 func (s *FileRangeSet) Fill(ctx context.Context, required, optional memmap.MappableRange, fileSize uint64, mf *pgalloc.MemoryFile, opts pgalloc.AllocOpts, readAt func(ctx context.Context, dsts safemem.BlockSeq, offset uint64) (uint64, error)) (uint64, error) {
+	required = roundOutToHostPages(required)
+	optional = roundOutToHostPages(optional)
 	gap := s.LowerBoundGap(required.Start)
 	var pagesAlloced uint64
 	for gap.Ok() && gap.Start() < required.End {
@@ -174,8 +184,15 @@ func (s *FileRangeSet) Fill(ctx context.Context, required, optional memmap.Mappa
 		fr, err := mf.Allocate(gr.Length(), opts)
 		opts.Huge = wantHuge
 
-		// Store anything we managed to read into the cache.
-		if done := fr.Length(); done != 0 {
+		// Store anything we managed to read into the cache. A short read
+		// may end within a host page; discard that page so that segments
+		// remain host-page-aligned.
+		done := fr.Length()
+		if keep := hostarch.PageRoundDown(done); keep != done {
+			mf.DecRef(memmap.FileRange{fr.Start + keep, fr.End})
+			done = keep
+		}
+		if done != 0 {
 			gr.End = gr.Start + done
 			pagesAlloced += gr.Length() / hostarch.PageSize
 			gap = s.Insert(gap, gr, fr.Start).NextGap()
@@ -186,6 +203,16 @@ func (s *FileRangeSet) Fill(ctx context.Context, required, optional memmap.Mappa
 		}
 	}
 	return pagesAlloced, nil
+}
+
+// roundOutToHostPages returns the smallest host-page-aligned range containing
+// mr.
+func roundOutToHostPages(mr memmap.MappableRange) memmap.MappableRange {
+	mr.Start = hostarch.PageRoundDown(mr.Start)
+	if end, ok := hostarch.PageRoundUp(mr.End); ok {
+		mr.End = end
+	}
+	return mr
 }
 
 // Drop removes segments for memmap.Mappable offsets in mr, freeing the

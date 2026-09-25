@@ -415,23 +415,24 @@ func (fd *controlFDLisa) Walk(name string) (*lisafs.ControlFD, lisafs.Statx, err
 		return unix.Openat(fd.hostFD, name, flags, 0)
 	})
 	if err != nil {
-		// On macOS, O_NOFOLLOW prevents opening symlinks (returns ELOOP).
-		// Handle this by stat'ing the symlink and creating a control FD
-		// using the parent directory FD.
+		// On macOS, O_NOFOLLOW fails with ELOOP on symlinks. Open the symlink
+		// itself so that stat and metadata operations on the control FD apply
+		// to the link rather than to its parent or target.
 		if err == unix.ELOOP || err == unix.EMLINK {
-			stat, stErr := walkStatAt(fd.hostFD, name)
-			if stErr != nil {
-				return nil, lisafs.Statx{}, stErr
+			symlinkFD, sErr := openSymlinkAt(fd.hostFD, name)
+			if sErr != nil {
+				return nil, lisafs.Statx{}, sErr
+			}
+			stat, sErr := fstatTo(symlinkFD)
+			if sErr != nil {
+				_ = unix.Close(symlinkFD)
+				return nil, lisafs.Statx{}, sErr
 			}
 			if stat.Mode&unix.S_IFMT == unix.S_IFLNK {
-				// Use dup of parent FD as a placeholder. The symlink
-				// will be resolved by the sentry's VFS layer.
-				symlinkFD, dErr := unix.Dup(fd.hostFD)
-				if dErr != nil {
-					return nil, lisafs.Statx{}, dErr
-				}
 				return newControlFDLisa(symlinkFD, fd, name, linux.ModeSymlink).FD(), stat, nil
 			}
+			// Replaced by a non-symlink since the open failed.
+			_ = unix.Close(symlinkFD)
 		}
 		return nil, lisafs.Statx{}, err
 	}
@@ -589,7 +590,7 @@ func (fd *controlFDLisa) Open(flags uint32) (*lisafs.OpenFD, int, error) {
 
 // OpenCreate implements lisafs.ControlFDImpl.OpenCreate.
 func (fd *controlFDLisa) OpenCreate(mode linux.FileMode, uid lisafs.UID, gid lisafs.GID, name string, flags uint32) (*lisafs.ControlFD, lisafs.Statx, *lisafs.OpenFD, int, error) {
-	createFlags := unix.O_CREAT | unix.O_EXCL | unix.O_RDONLY | unix.O_NONBLOCK | openFlags
+	createFlags := unix.O_CREAT | unix.O_EXCL | createAccessMode | unix.O_NONBLOCK | openFlags
 	childHostFD, err := unix.Openat(fd.hostFD, name, createFlags, uint32(mode&^linux.FileTypeMask))
 	if err != nil {
 		return nil, lisafs.Statx{}, nil, -1, err
@@ -730,14 +731,8 @@ func (fd *controlFDLisa) Symlink(name string, target string, uid lisafs.UID, gid
 	})
 	defer cu.Clean()
 
-	// Open symlink to change ownership. On macOS, O_NOFOLLOW rejects
-	// symlinks with ELOOP. Use O_SYMLINK (0x200000) to open the symlink
-	// itself rather than following it.
-	openFlags := unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_CLOEXEC
-	if runtime.GOOS == "darwin" {
-		openFlags = unix.O_RDONLY | 0x200000 | unix.O_CLOEXEC // O_SYMLINK
-	}
-	symlinkFD, err := unix.Openat(fd.hostFD, name, openFlags, 0)
+	// Open the symlink itself to change ownership.
+	symlinkFD, err := openSymlinkAt(fd.hostFD, name)
 	if err != nil {
 		return nil, lisafs.Statx{}, err
 	}
@@ -819,9 +814,8 @@ func (fd *controlFDLisa) Readlink(getLinkBuf func(uint32) []byte) (uint16, error
 		b := getLinkBuf(uint32(linkLen))
 		n, err := readlinkatFD(fd.hostFD, b)
 		if err != nil {
-			// On macOS, the hostFD for a symlink may be a dup of the parent
-			// directory (since O_NOFOLLOW can't open symlinks). Fall back to
-			// using the node's file path.
+			// macOS cannot readlink through an FD; readlinkatFD resolves the
+			// FD's path, which may fail. Fall back to the node's file path.
 			n, err = unix.Readlink(fd.Node().FilePath(), b)
 		}
 		if err != nil {
@@ -1028,8 +1022,18 @@ func (fd *controlFDLisa) BindAt(name string, sockType uint32, mode linux.FileMod
 }
 
 // Unlink implements lisafs.ControlFDImpl.Unlink.
+//
+// flags are Linux unlinkat(2) flags; AT_REMOVEDIR has a different value on
+// some hosts (e.g. macOS).
 func (fd *controlFDLisa) Unlink(name string, flags uint32) error {
-	return unix.Unlinkat(fd.hostFD, name, int(flags))
+	if flags&^linux.AT_REMOVEDIR != 0 {
+		return unix.EINVAL
+	}
+	hostFlags := 0
+	if flags&linux.AT_REMOVEDIR != 0 {
+		hostFlags = unix.AT_REMOVEDIR
+	}
+	return unix.Unlinkat(fd.hostFD, name, hostFlags)
 }
 
 // RenameAt implements lisafs.ControlFDImpl.RenameAt.

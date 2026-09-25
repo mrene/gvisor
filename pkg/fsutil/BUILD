@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "go_test")
 
 package(default_applicable_licenses = ["//:license"])
 
@@ -19,4 +19,12 @@ go_library(
         "//pkg/syserr",
         "@org_golang_x_sys//unix:go_default_library",
     ],
+)
+
+go_test(
+    name = "fsutil_test",
+    size = "small",
+    srcs = ["fsutil_test.go"],
+    library = ":fsutil",
+    deps = ["@org_golang_x_sys//unix:go_default_library"],
 )

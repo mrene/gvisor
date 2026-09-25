@@ -168,7 +168,6 @@ go_library(
         "pgalloc.go",
         "pgalloc_alloc_darwin.go",
         "pgalloc_alloc_linux.go",
-        "mach_memory_darwin.go",
         "pgalloc_darwin.go",
         "pgalloc_linux.go",
         "pgalloc_unsafe.go",
@@ -217,6 +216,8 @@ go_test(
     library = ":pgalloc",
     deps = [
         "//pkg/hostarch",
+        "//pkg/safemem",
         "//pkg/sentry/memmap",
+        "//pkg/sentry/usage",
     ],
 )

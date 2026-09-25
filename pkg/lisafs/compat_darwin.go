@@ -14,7 +14,10 @@
 
 package lisafs
 
-import "golang.org/x/sys/unix"
+import (
+	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/syserr"
+)
 
 // STATX constants used by the lisafs protocol. These are protocol-level
 // constants with the same values as on Linux, used to interpret wire messages
@@ -32,18 +35,44 @@ const (
 // exist on macOS; use EIO as a fallback.
 const errREMOTEIO = unix.EIO
 
-// pollRDHUP is the poll event for detecting remote hangup. POLLRDHUP does not
-// exist on macOS; on macOS POLLHUP covers both local and remote hangup.
-const pollRDHUP = int16(0)
-
-// ppoll wraps poll functionality. macOS does not have ppoll(2), so we use
-// poll(2) instead (ignoring the sigmask, which is acceptable for this use).
-func ppoll(fds []unix.PollFd, timeout *unix.Timespec, sigmask *byte) (int, error) {
-	// Convert timeout to milliseconds for poll(2). nil timeout means block
-	// indefinitely.
-	timeoutMs := -1 // block indefinitely
-	if timeout != nil {
-		timeoutMs = int(timeout.Sec*1000 + int64(timeout.Nsec)/1e6)
+// hostErrnoToLinux returns the Linux errno, which the protocol carries, for
+// host errno e. macOS and Linux errno values differ from 35 (EAGAIN) up.
+func hostErrnoToLinux(e unix.Errno) unix.Errno {
+	if !syserr.IsValid(e) {
+		return unix.EIO // Same value on Linux.
 	}
-	return unix.Poll(fds, timeoutMs)
+	return unix.Errno(syserr.FromHost(e).ToLinux())
+}
+
+// waitHangup blocks until the socket fd is shut down locally or its peer
+// hangs up. poll(2) cannot do this on macOS: when only POLLHUP is requested, a
+// hangup that follows unread data (e.g. an RPC response not yet read by its
+// caller) is never reported. EVFILT_READ reports EV_EOF on hangup whether or
+// not data is queued; EV_CLEAR limits wakeups to receive buffer changes.
+func waitHangup(fd int) error {
+	kq, err := unix.Kqueue()
+	if err != nil {
+		return err
+	}
+	defer unix.Close(kq)
+	var ev [1]unix.Kevent_t
+	unix.SetKevent(&ev[0], fd, unix.EVFILT_READ, unix.EV_ADD|unix.EV_CLEAR)
+	if _, err := unix.Kevent(kq, ev[:], nil, nil); err != nil {
+		return err
+	}
+	for {
+		n, err := unix.Kevent(kq, nil, ev[:], nil)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if n == 1 && ev[0].Flags&unix.EV_ERROR != 0 {
+			return unix.Errno(ev[0].Data)
+		}
+		if n == 1 && ev[0].Flags&unix.EV_EOF != 0 {
+			return nil
+		}
+	}
 }

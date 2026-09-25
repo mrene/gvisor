@@ -1,4 +1,4 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 
 package(
     default_applicable_licenses = ["//:license"],
@@ -10,6 +10,8 @@ go_library(
     srcs = [
         "cgo.go",
         "main.go",
+        "mounts.go",
+        "nixbuild.go",
     ],
     cgo = True,
     clinkopts = ["-framework Hypervisor"],
@@ -29,6 +31,7 @@ go_library(
         "//pkg/sentry/fsimpl/devtmpfs",
         "//pkg/sentry/fsimpl/gofer",
         "//pkg/sentry/fsimpl/host",
+        "//pkg/sentry/fsimpl/overlay",
         "//pkg/sentry/fsimpl/proc",
         "//pkg/sentry/fsimpl/tmpfs",
         "//pkg/unet",
@@ -42,7 +45,6 @@ go_library(
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/limits",
         "//pkg/sentry/loader",
-        "//pkg/sentry/mm",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/platform",
         "//pkg/sentry/platform/hvf",
@@ -75,6 +77,16 @@ go_library(
         "//pkg/waiter",
         "@org_golang_x_sys//unix:go_default_library",
     ],
+)
+
+go_test(
+    name = "sentrydarwin_test",
+    size = "small",
+    srcs = [
+        "mounts_test.go",
+        "nixbuild_test.go",
+    ],
+    embed = [":sentrydarwin_lib"],
 )
 
 go_binary(

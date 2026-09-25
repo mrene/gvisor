@@ -75,21 +75,50 @@ const darwinOpenMask = unix.O_RDONLY | unix.O_WRONLY | unix.O_RDWR |
 	unix.O_NONBLOCK | unix.O_APPEND | unix.O_CREAT | unix.O_TRUNC |
 	unix.O_EXCL | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
 
+// createAccessMode is the access mode OpenCreate creates files with. The
+// creating open(2) is granted its access mode regardless of the new file's
+// permission bits, but the later reopen by path is checked against them, and
+// the gofer has no CAP_DAC_OVERRIDE on macOS. Creating with O_RDWR keeps
+// open(O_CREAT|O_WRONLY, 0400) writable: reopenFD falls back to this FD.
+const createAccessMode = unix.O_RDWR
+
 // reopenFD reopens a file descriptor with new flags.
 // macOS doesn't have /proc/self/fd. We use fcntl(F_GETPATH) + open.
 // Linux-only flags are stripped before opening.
+//
+// If the reopen fails (e.g. EACCES because the file mode denies the requested
+// access, or the file was unlinked), hostFD is duplicated instead, but only
+// when its access mode grants everything flags asks for. Otherwise the open
+// error is returned: handing out a read-only FD for a write open turns the
+// permission error into EBADF on every later write.
 func reopenFD(hostFD int, flags int) (int, error) {
 	flags &= darwinOpenMask
-	// Try to get the path and reopen.
 	path, err := fcntlGetpath(hostFD)
 	if err == nil {
-		newFD, err := unix.Open(path, flags, 0)
-		if err == nil {
+		newFD, openErr := unix.Open(path, flags, 0)
+		if openErr == nil {
 			return newFD, nil
 		}
+		err = openErr
 	}
-	// Fallback: just dup the FD.
-	return unix.Dup(hostFD)
+	have, fcntlErr := unix.FcntlInt(uintptr(hostFD), unix.F_GETFL, 0)
+	if fcntlErr != nil {
+		return -1, err
+	}
+	if want := flags & unix.O_ACCMODE; have&unix.O_ACCMODE != unix.O_RDWR && have&unix.O_ACCMODE != want {
+		return -1, err
+	}
+	newFD, err := unix.Dup(hostFD)
+	if err != nil {
+		return -1, err
+	}
+	if flags&unix.O_TRUNC != 0 {
+		if err := unix.Ftruncate(newFD, 0); err != nil {
+			unix.Close(newFD)
+			return -1, err
+		}
+	}
+	return newFD, nil
 }
 
 // openParentDir opens the parent directory of filePath.
@@ -187,9 +216,15 @@ func tryOpenFallbackFlags() []int {
 	// Since the flag is ORed, we can't remove O_NOFOLLOW. Return
 	// O_SYMLINK and accept that O_NOFOLLOW will be ORed in.
 	// However, O_SYMLINK|O_NOFOLLOW returns ELOOP on macOS, so this
-	// fallback simply won't match any symlinks. The gofer handles
-	// symlinks through the readlinkat path (fd.ReadLinkAt) instead.
+	// fallback simply won't match any symlinks. Walk opens symlinks with
+	// openSymlinkAt instead.
 	return []int{unix.O_SYMLINK}
+}
+
+// openSymlinkAt opens the symlink name in dirFD itself, without following
+// it.
+func openSymlinkAt(dirFD int, name string) (int, error) {
+	return unix.Openat(dirFD, name, unix.O_RDONLY|unix.O_SYMLINK|unix.O_CLOEXEC, 0)
 }
 
 // fstatToStatx converts an Fstat result to lisafs.Statx on darwin.

@@ -186,6 +186,7 @@ func (c *Connection) service(ch *channel) error {
 	return nil
 }
 
+// respondError responds with err, a Linux errno.
 func (c *Connection) respondError(comm Communicator, err unix.Errno) (MID, uint32, []int) {
 	resp := &ErrorResp{errno: uint32(err)}
 	respLen := uint32(resp.SizeBytes())
@@ -200,7 +201,7 @@ func (c *Connection) handleMsg(comm Communicator, m MID, payloadLen uint32) (ret
 	}
 	if !c.reqGate.Enter() {
 		// c.close() has been called; the connection is shutting down.
-		return c.respondError(comm, unix.ECONNRESET)
+		return c.respondError(comm, hostErrnoToLinux(unix.ECONNRESET))
 	}
 	defer func() {
 		c.reqGate.Leave()
@@ -220,13 +221,13 @@ func (c *Connection) handleMsg(comm Communicator, m MID, payloadLen uint32) (ret
 	// Check if the message is supported for forward compatibility.
 	if int(m) >= len(c.server.handlers) || c.server.handlers[m] == nil {
 		log.Warningf("received request which is not supported by the server, MID = %d", m)
-		return c.respondError(comm, unix.EOPNOTSUPP)
+		return c.respondError(comm, hostErrnoToLinux(unix.EOPNOTSUPP))
 	}
 
 	// Check if the message is supported by the connection.
 	if int(m) >= len(c.supported) || !c.supported[m] {
 		log.Warningf("received request which is not supported on this connection, MID = %d", m)
-		return c.respondError(comm, unix.EOPNOTSUPP)
+		return c.respondError(comm, hostErrnoToLinux(unix.EOPNOTSUPP))
 	}
 
 	// Try handling the request.

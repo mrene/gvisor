@@ -33,6 +33,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
 
@@ -105,6 +106,17 @@ func (*HVF) MinUserAddress() hostarch.Addr { return hostarch.Addr(2 * hvfPageSiz
 // MaxUserAddress implements platform.Platform.MaxUserAddress.
 func (*HVF) MaxUserAddress() hostarch.Addr { return hostarch.Addr(maxUserAddress.Load()) }
 
+// SetMemoryFile tells h that mf is the sentry's main MemoryFile, which backs
+// most guest memory. Guest mappings of mf then use a permanent IPA mapping of
+// each of its chunks instead of an IPA per page.
+//
+// Preconditions: No address space of h has been created. mf's chunk mappings
+// are not replaced (see pgalloc.MemoryFile.ChunkMapping) while h runs.
+func (h *HVF) SetMemoryFile(mf *pgalloc.MemoryFile) {
+	h.machine.memFile.mf = mf
+	h.machine.memFile.mapped = make(map[uint64]struct{})
+}
+
 // NewAddressSpace implements platform.Platform.NewAddressSpace.
 func (h *HVF) NewAddressSpace() (platform.AddressSpace, error) {
 	return newAddressSpace(h.machine)
@@ -113,14 +125,6 @@ func (h *HVF) NewAddressSpace() (platform.AddressSpace, error) {
 // NewContext implements platform.Platform.NewContext.
 func (h *HVF) NewContext(_ pkgcontext.Context) platform.Context {
 	return &hvfContext{machine: h.machine}
-}
-
-// PatchInitFastPath writes the init task's IDs into the vectors page
-// for in-VM fast-path syscall dispatch at EL1.
-func PatchInitFastPath(p platform.Platform, pid, ppid, tid, uid, euid, gid, egid, pgid, sid uint16) {
-	if h, ok := p.(*HVF); ok {
-		h.machine.PatchFastPathSyscalls(pid, ppid, tid, uid, euid, gid, egid, pgid, sid)
-	}
 }
 
 // SeccompInfo implements platform.Platform.SeccompInfo.

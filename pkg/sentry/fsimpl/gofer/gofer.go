@@ -1385,7 +1385,8 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs
 			// There's no point to updating d's metadata in this case since
 			// it'll be overwritten by revalidation before the next time it's
 			// used anyway. (InteropModeShared inhibits client caching of
-			// regular file data, so there's no cache to truncate either.)
+			// regular file data except for memory-mapped pages under
+			// forcePageCache, which are truncated above on size changes.)
 			return nil
 		}
 	}
