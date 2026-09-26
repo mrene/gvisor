@@ -78,11 +78,12 @@ macOS 26 SDK) and signs the binary with the Hypervisor entitlement:
 nix build .#sentrydarwin   # result/bin/sentrydarwin
 ```
 
-The flake fetches Bazel's external repositories once, with `bazel vendor`, into
-a fixed-output derivation, then builds offline. Nix reuses that derivation
-until its hash changes, so after changing `MODULE.bazel`, `go.mod` or `go.sum`,
-set `outputHash` in `flake.nix` to `lib.fakeHash`, build, and paste the hash
-Nix reports. Nix only sees files tracked by git (`git add -N` new files).
+The flake (flake-parts; one module per feature under `nix/`) fetches Bazel's
+external repositories once, with `bazel vendor`, into a fixed-output
+derivation, then builds offline. Nix reuses that derivation until its hash
+changes, so after changing `MODULE.bazel`, `go.mod` or `go.sum`, set
+`outputHash` in `nix/sentrydarwin.nix` to `lib.fakeHash`, build, and paste the
+hash Nix reports. Nix only sees files tracked by git (`git add -N` new files).
 
 ### Flags
 
@@ -200,22 +201,19 @@ terminal has access to them.
 ### A tool environment
 
 The empty guest root has no `/bin/sh`, `/usr/bin/env` or anything on `PATH`.
-[`nix/flake.nix`](nix/flake.nix) builds a Linux tool environment (bash,
-coreutils, git, ripgrep, fd, ..., and the `nvim` package of its `dotfiles`
-input, a local flake: point it at yours or use nixpkgs `neovim`) and a wrapper, `sb`, that puts it
-on `PATH`, sets `SHELL`, links `/bin/sh` and `/usr/bin/env` into the guest
-root, trusts all git repositories (shared files belong to your uid while the
-guest runs as root), and runs a command (default: a login bash). Its `nix run` app starts
-`sb` under `sentrydarwin` (from `PATH`, or `$SENTRYDARWIN`, with extra flags
-from `$SENTRYDARWIN_FLAGS`); building it needs the [Nix
-builder](#building-with-nix). Until `nix/` is tracked by git, refer to it as
-`path:./nix`:
+[`nix/sandbox.nix`](nix/sandbox.nix) builds a Linux tool environment (bash,
+coreutils, git, ripgrep, fd, procps, ncurses' terminfo, ...) and a wrapper,
+`sb`, that puts it on `PATH`, sets `SHELL`, links `/bin/sh` and `/usr/bin/env`
+into the guest root, trusts all git repositories (shared files belong to your
+uid while the guest runs as root), and runs a command (default: a login bash).
+The flake's `sb` app starts `sb` under `sentrydarwin` (from `PATH`, or
+`$SENTRYDARWIN`, with extra flags from `$SENTRYDARWIN_FLAGS`); building it
+needs the [Nix builder](#building-with-nix):
 
 ```console
-$ nix run path:./nix                      # login bash
-$ nix run path:./nix -- nvim file.go      # :!, system() and :terminal work
-$ SENTRYDARWIN_FLAGS="--mount $HOME/src/project:ro" nix run path:./nix -- git -C ~/src/project log -1
-$ nix build 'path:./nix#packages.aarch64-linux.sb' -o sb && sentrydarwin ./sb/bin/sb
+$ nix run .#sb                            # login bash
+$ SENTRYDARWIN_FLAGS="--mount $HOME/src/project:ro" nix run .#sb -- git -C ~/src/project log -1
+$ nix build .#packages.aarch64-linux.sb -o sb && sentrydarwin ./sb/bin/sb
 ```
 
 ### Building with Nix
